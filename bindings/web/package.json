@@ -9,6 +9,7 @@
     "test:workflow": "node --test tests/workflow.test.mjs",
     "test:variables": "node --test tests/variables.test.mjs",
     "test:expressions": "node --test tests/expressions.test.mjs",
+    "test:graph": "node --test tests/graph-editor.test.mjs",
     "test:unit": "node --test tests/*.test.mjs",
     "preview": "vite preview"
   },

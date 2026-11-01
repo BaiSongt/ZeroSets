@@ -62,6 +62,16 @@ The dev server serves the Notebook prototype at `http://127.0.0.1:5173/`.
 
 公式以可选的 `expression` 字段保存在 v1 JSON 中，计算值仍按旧版 Number 参数传给 WASM；变量脚本**不执行任意 JavaScript**。
 
+### Graph 可编辑工作区（V0.7）
+
+1. 切到 **Graph**，在画布空白处右键、按 `A` 或点击顶部 `+`，打开 Block 快速搜索；输入名称后按 Enter，节点会落在对应画布位置，不会自动改变缩放与平移。
+2. 从一个节点的**输出端口**拖到另一个节点的**输入端口**建立连接；也可反向从输入拖到输出以重连。连接前预览可用端口，并阻止类型不匹配及循环依赖。
+3. 将输出端口拖到空白处，可直接选择一个兼容的新 Block 并自动连上；将已连接的输入端口拖到空白处则会断开连接。双击或右键已有边也能断开。
+4. 选中节点后，右侧 Inspector 可设置名称、重载、数值/变量绑定、启用状态；双击节点或点击节点内 `⚙` 进入属性。在 Graph **展开**模式下，`⚙` 会打开可关闭的浮动属性抽屉，不会压缩画布。
+5. 鼠标中键拖动画布、滚轮缩放，支持多选、Delete、复制与 Undo/Redo。Graph 节点坐标保存在 JSON 的可选 `graph_layout` 字段中，旧版文件仍可加载；Graph 与 Notebook 始终共用同一份计算快照。
+
+Graph 交互规则测试：在 `bindings/web` 下运行 `pnpm test:graph`，或运行 `pnpm test:unit` 执行全部用例。
+
 The UI uses localStorage keys `zeroset.theme`, `zeroset.language`, and
 `zeroset.panel-layout` for persisted preferences and panel widths.
 

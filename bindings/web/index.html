@@ -198,6 +198,7 @@
         </div>
         <span class="workspace-mode-spacer"></span>
         <button id="notebook-add" type="button" class="workspace-action" data-i18n-title="action.addBlock" title="添加 Block">＋</button>
+        <button id="graph-properties-toggle" type="button" class="workspace-action hidden" aria-pressed="false" data-i18n-title="graph.editProperties" title="编辑选中节点属性">⚙</button>
         <button id="graph-expand" type="button" class="workspace-action hidden" aria-pressed="false" data-i18n-title="action.expandGraph" title="展开关系图至整个工作区">
           <svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M6 2.5H2.5V6M10 2.5h3.5V6M2.5 10v3.5H6M13.5 10v3.5H10"/></svg>
           <span id="graph-expand-label" data-i18n="action.expandGraph">展开</span>
@@ -210,6 +211,13 @@
           <div id="instance-list"></div>
         </div>
         <div id="marquee" class="hidden"></div>
+        <div id="graph-edit-hint" data-i18n="graph.hintCompact">Drag ports · Right-click to add</div>
+        <div id="graph-quick-add" class="hidden" role="dialog" aria-label="Add Block in Graph">
+          <div class="graph-quick-add-head"><span data-i18n="graph.quickAddTitle">Add Block</span><kbd>Esc</kbd></div>
+          <input id="graph-quick-search" type="search" data-i18n-placeholder="graph.quickSearch" placeholder="Search Blocks" autocomplete="off" spellcheck="false" />
+          <div id="graph-quick-results" role="listbox"></div>
+          <div class="graph-quick-foot" data-i18n="graph.quickHint">Enter to insert at cursor</div>
+        </div>
       </div>
     </section>
     <div id="graph-resizer" class="resizer" data-resize="graph" title="Drag to resize; double-click to reset"></div>
