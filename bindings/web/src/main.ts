@@ -33,6 +33,7 @@ import {
   type Theme,
 } from "./theme";
 import { acceptsOutput, createsCycle, planAutoConnections } from "./workflow";
+import { bezierWire, exportGraphLayout, graphPointAt, importGraphLayout, planGraphConnection, type GraphPoint, type GraphPort } from "./graph-editor";
 import {
   dependentVariableIds,
   FormulaError,
@@ -109,6 +110,7 @@ type Snapshot = {
   update_policy?: "auto" | "manual";
   variables?: NamedVariable[];
   next_variable_id?: number;
+  graph_layout?: Record<string, GraphPoint>;
   instances: Instance[];
 };
 
@@ -147,6 +149,10 @@ const showGraphButton = document.querySelector<HTMLButtonElement>("#show-graph")
 const graphExpandButton = document.querySelector<HTMLButtonElement>("#graph-expand");
 const graphExpandLabel = document.querySelector<HTMLElement>("#graph-expand-label");
 const notebookAddButton = document.querySelector<HTMLButtonElement>("#notebook-add");
+const graphPropertiesButton = document.querySelector<HTMLButtonElement>("#graph-properties-toggle");
+const graphQuickAdd = document.querySelector<HTMLElement>("#graph-quick-add");
+const graphQuickSearch = document.querySelector<HTMLInputElement>("#graph-quick-search");
+const graphQuickResults = document.querySelector<HTMLElement>("#graph-quick-results");
 const graphWorld = document.querySelector<HTMLElement>("#graph-world");
 const wires = document.querySelector<SVGSVGElement>("#wires");
 const marquee = document.querySelector<HTMLElement>("#marquee");
@@ -194,6 +200,10 @@ if (
   !graphExpandButton ||
   !graphExpandLabel ||
   !notebookAddButton ||
+  !graphPropertiesButton ||
+  !graphQuickAdd ||
+  !graphQuickSearch ||
+  !graphQuickResults ||
   !graphWorld ||
   !wires ||
   !marquee ||
@@ -241,6 +251,11 @@ type WorkspaceMode = "notebook" | "graph";
 const WORKSPACE_MODE_KEY = "zeroset.workspace-mode";
 let workspaceMode: WorkspaceMode = "notebook";
 let graphExpanded = false;
+let graphPropertiesOpen = false;
+let graphAddPosition: GraphPoint | null = null;
+let graphAddSourceId: number | null = null;
+let activeGraphWire: { from: GraphPort; element: HTMLElement; pointer: GraphPoint } | null = null;
+let cancelGraphWireDrag: (() => void) | null = null;
 let zoom = 1;
 let panX = 0;
 let panY = 0;
@@ -1141,13 +1156,17 @@ function updateCanvasSize(): void {
     width = Math.max(width, position.x + 190);
     height = Math.max(height, position.y + 150);
   }
-  graphWorld!.style.width = `${Math.max(width, 1)}px`;
-  graphWorld!.style.height = `${Math.max(height, 1)}px`;
+  const visibleWidth = (notebookBody!.clientWidth - panX) / zoom;
+  const visibleHeight = (notebookBody!.clientHeight - panY) / zoom;
+  graphWorld!.style.width = `${Math.max(width, visibleWidth + 100, 1)}px`;
+  graphWorld!.style.height = `${Math.max(height, visibleHeight + 100, 1)}px`;
 }
 
 function applyView(): void {
   graphWorld!.style.transform = `translate(${panX}px, ${panY}px) scale(${zoom})`;
   zoomLabel!.textContent = `${Math.round(zoom * 100)}%`;
+  updateCanvasSize();
+  scheduleWires();
 }
 
 function captureHistory(): HistoryEntry {
@@ -1445,10 +1464,104 @@ function autoConnectionsFor(def: BlockDef): Record<string, number> {
   return planAutoConnections(def.overloads[0]?.inputs ?? [], sources);
 }
 
-function addBlock(def: BlockDef, connectSelected = false): void {
+function closeGraphQuickAdd(): void {
+  graphQuickAdd!.classList.add("hidden");
+  graphAddPosition = null;
+  graphAddSourceId = null;
+}
+
+function graphOffersSource(def: BlockDef, sourceId: number | null): boolean {
+  if (sourceId === null) return true;
+  const source = instanceById(sourceId);
+  const type = source ? outputType(source) : undefined;
+  if (!type) return false;
+  if (type === "field" && (def.id === "list" || def.id === "custom")) return true;
+  return (def.overloads[0]?.inputs ?? []).some((input) =>
+    ["field", "mesh", "list", "any"].includes(input.value_type) && acceptsOutput(input.value_type, type));
+}
+
+function renderGraphQuickResults(): void {
+  const list = graphQuickResults!;
+  list.replaceChildren();
+  const query = graphQuickSearch!.value.trim().toLocaleLowerCase();
+  const matches = catalog.filter((def) => graphOffersSource(def, graphAddSourceId) &&
+    `${blockLabel(def.id, def.name)} ${def.name} ${def.id} ${categoryLabel(def.category)}`.toLocaleLowerCase().includes(query));
+  if (matches.length === 0) {
+    const hint = document.createElement("p");
+    hint.className = "graph-quick-empty";
+    hint.textContent = t("graph.quickEmpty");
+    list.append(hint);
+    return;
+  }
+  for (const [index, def] of matches.slice(0, 60).entries()) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "graph-quick-option";
+    if (index === 0) button.classList.add("active");
+    button.setAttribute("role", "option");
+    button.setAttribute("aria-selected", String(index === 0));
+    const name = document.createElement("span");
+    name.textContent = blockLabel(def.id, def.name);
+    const output = document.createElement("span");
+    output.textContent = def.overloads[0]?.output ?? "";
+    button.append(name, output);
+    button.addEventListener("click", () => {
+      const position = graphAddPosition ?? { x: 24, y: 24 };
+      const sourceId = graphAddSourceId;
+      closeGraphQuickAdd();
+      addBlock(def, false, position, sourceId);
+    });
+    list.append(button);
+  }
+}
+
+function openGraphQuickAdd(clientX: number, clientY: number, sourceId: number | null = null): void {
+  if (workspaceMode !== "graph") return;
+  const rect = notebookBody!.getBoundingClientRect();
+  graphAddPosition = graphPointAt(clientX, clientY, rect.left, rect.top, panX, panY, zoom);
+  graphAddSourceId = sourceId;
+  const x = Math.max(6, Math.min(clientX - rect.left, rect.width - 280));
+  const y = Math.max(6, Math.min(clientY - rect.top, rect.height - 278));
+  graphQuickAdd!.style.left = `${x}px`;
+  graphQuickAdd!.style.top = `${y}px`;
+  graphQuickAdd!.classList.remove("hidden");
+  graphQuickSearch!.value = "";
+  renderGraphQuickResults();
+  graphQuickSearch!.focus();
+}
+
+function setGraphPropertiesOpen(open: boolean): void {
+  graphPropertiesOpen = open;
+  const visible = open && workspaceMode === "graph" && graphExpanded;
+  document.body.classList.toggle("graph-properties-open", visible);
+  graphPropertiesButton!.classList.toggle("active", visible);
+  graphPropertiesButton!.setAttribute("aria-pressed", String(visible));
+}
+
+function inspectGraphNode(id: number): void {
+  const previousTargetId = meshTarget()?.id ?? null;
+  selectedId = id;
+  selectedIds = new Set([id]);
+  renderInstances();
+  renderProperties();
+  updatePreviewAfterSelection(previousTargetId);
+  if (graphExpanded) setGraphPropertiesOpen(true);
+  else if (window.innerWidth <= 900) {
+    document.body.classList.add("show-properties");
+    togglePropertiesButton?.classList.add("active");
+  }
+}
+
+function addBlock(def: BlockDef, connectSelected = false, graphPosition?: GraphPoint, sourceId?: number | null): void {
   const overload = def.overloads[0];
   if (!overload) return;
-  const inputs = connectSelected ? autoConnectionsFor(def) : {};
+  const source = sourceId === undefined || sourceId === null ? undefined : instanceById(sourceId);
+  const sourceType = source ? outputType(source) : undefined;
+  const inputs = source && sourceType
+    ? planAutoConnections(overload.inputs, [{ id: source.id, output: sourceType }])
+    : connectSelected ? autoConnectionsFor(def) : {};
+  if (source && sourceType === "field" && Object.keys(inputs).length === 0 &&
+      (def.id === "list" || def.id === "custom")) inputs.in1 = source.id;
   const id = snapshot.next_id++;
   snapshot.instances.push({
     id,
@@ -1462,12 +1575,16 @@ function addBlock(def: BlockDef, connectSelected = false): void {
   });
   selectedId = id;
   selectedIds = new Set([id]);
+  if (graphPosition) {
+    nodePositions.set(id, { x: Math.max(4, graphPosition.x - 75), y: Math.max(4, graphPosition.y - 20) });
+  }
   layoutNodes();
   commitHistory();
   renderAll();
   scheduleBuild();
   if (workspaceMode === "notebook") notebookList!.scrollTop = notebookList!.scrollHeight;
-  else fitCanvas();
+  else if (!graphPosition) fitCanvas();
+  else scheduleWires();
 }
 
 function deleteInstance(id: number): void {
@@ -1581,6 +1698,7 @@ function connectInput(targetId: number, inputName: string, sourceId: number): bo
   const source = instanceById(sourceId);
   if (!target || !source) return false;
   let input = inputsFor(target).find((candidate) => candidate.name === inputName);
+  const createdFreePort = !input && isFreePortBlock(target);
   if (!input && isFreePortBlock(target)) {
     input = { name: inputName, value_type: "field", required: false, unit: "any", default: null };
   }
@@ -1595,6 +1713,7 @@ function connectInput(targetId: number, inputName: string, sourceId: number): bo
     showToast(t("toast.connectCycle"));
     return false;
   }
+  if (createdFreePort) target.ports = [...(target.ports ?? []), inputName];
   target.inputs[inputName] = sourceId;
   commitHistory();
   renderAll();
@@ -1674,16 +1793,23 @@ function syncWorkspaceModeControls(): void {
   showGraphButton!.classList.toggle("active", graphMode);
   showGraphButton!.setAttribute("aria-pressed", String(graphMode));
   graphExpandButton!.classList.toggle("hidden", !graphMode);
+  graphPropertiesButton!.classList.toggle("hidden", !graphMode || !graphExpanded);
   graphExpandButton!.setAttribute("aria-pressed", String(graphMode && graphExpanded));
   const expandKey = graphExpanded ? "action.restoreGraph" : "action.expandGraph";
   graphExpandButton!.title = t(expandKey);
   graphExpandLabel!.textContent = t(expandKey);
   workspaceTitle!.textContent = t(graphMode ? "panel.graph" : "panel.notebook");
+  setGraphPropertiesOpen(graphPropertiesOpen);
 }
 
 function setWorkspaceMode(nextMode: WorkspaceMode): void {
+  cancelGraphWireDrag?.();
   workspaceMode = nextMode;
-  if (nextMode === "notebook") graphExpanded = false;
+  closeGraphQuickAdd();
+  if (nextMode === "notebook") {
+    graphExpanded = false;
+    graphPropertiesOpen = false;
+  }
   syncWorkspaceModeControls();
   try {
     localStorage.setItem(WORKSPACE_MODE_KEY, nextMode);
@@ -1699,7 +1825,13 @@ function setWorkspaceMode(nextMode: WorkspaceMode): void {
 
 function setGraphExpanded(expanded: boolean): void {
   if (workspaceMode !== "graph") return;
+  cancelGraphWireDrag?.();
   graphExpanded = expanded;
+  if (!expanded) graphPropertiesOpen = false;
+  if (expanded) {
+    document.body.classList.remove("show-properties");
+    togglePropertiesButton?.classList.remove("active");
+  }
   syncWorkspaceModeControls();
   requestAnimationFrame(() => {
     refreshLayout();
@@ -2186,6 +2318,127 @@ function renderPalette(): void {
   }
 }
 
+function graphPortFromElement(element: HTMLElement): GraphPort | null {
+  const nodeId = Number(element.dataset.instanceId);
+  if (!Number.isSafeInteger(nodeId) || nodeId <= 0) return null;
+  if (element.dataset.port === "out") {
+    const source = instanceById(nodeId);
+    const valueType = source ? outputType(source) : undefined;
+    return valueType ? { kind: "output", nodeId, valueType } : null;
+  }
+  if (element.classList.contains("input-port") && element.dataset.input) {
+    return { kind: "input", nodeId, name: element.dataset.input, valueType: element.dataset.valueType ?? "field" };
+  }
+  return null;
+}
+
+function graphPortAt(clientX: number, clientY: number): { element: HTMLElement; port: GraphPort } | null {
+  for (const hit of document.elementsFromPoint(clientX, clientY)) {
+    const element = hit.closest<HTMLElement>(".input-port[data-instance-id], .port[data-port='out']")
+      ?? hit.closest<HTMLElement>(".input-row")?.querySelector<HTMLElement>(".input-port[data-instance-id]");
+    if (!element || !graphWorld!.contains(element)) continue;
+    const port = graphPortFromElement(element);
+    if (port) return { element, port };
+  }
+  return null;
+}
+
+function graphPortAnchor(element: HTMLElement, port: GraphPort): GraphPoint {
+  const rect = element.getBoundingClientRect();
+  const world = graphWorld!.getBoundingClientRect();
+  return {
+    x: ((port.kind === "output" ? rect.right : rect.left) - world.left) / zoom,
+    y: (rect.top + rect.height / 2 - world.top) / zoom,
+  };
+}
+
+function clearGraphWire(): void {
+  activeGraphWire = null;
+  document.body.classList.remove("graph-connecting");
+  instanceList!.querySelectorAll(".input-port.over, .input-port.incompatible, .input-port.can-connect, .port.can-connect")
+    .forEach((element) => element.classList.remove("over", "incompatible", "can-connect"));
+  scheduleWires();
+}
+
+function startGraphPortDrag(event: PointerEvent, element: HTMLElement, from: GraphPort): void {
+  if (workspaceMode !== "graph" || event.button !== 0) return;
+  event.preventDefault();
+  event.stopPropagation();
+  closeGraphQuickAdd();
+  const rect = notebookBody!.getBoundingClientRect();
+  const startX = event.clientX;
+  const startY = event.clientY;
+  let moved = false;
+  activeGraphWire = {
+    from, element,
+    pointer: graphPointAt(event.clientX, event.clientY, rect.left, rect.top, panX, panY, zoom),
+  };
+  document.body.classList.add("graph-connecting");
+
+  for (const candidate of instanceList!.querySelectorAll<HTMLElement>(".input-port[data-instance-id], .port[data-port='out']")) {
+    const port = graphPortFromElement(candidate);
+    if (port && candidate !== element && planGraphConnection(snapshot.instances, from, port).ok) {
+      candidate.classList.add("can-connect");
+    }
+  }
+
+  const move = (pointer: PointerEvent): void => {
+    if (pointer.pointerId !== event.pointerId || !activeGraphWire) return;
+    if (!moved && Math.hypot(pointer.clientX - startX, pointer.clientY - startY) < 3) return;
+    moved = true;
+    activeGraphWire.pointer = graphPointAt(pointer.clientX, pointer.clientY, rect.left, rect.top, panX, panY, zoom);
+    instanceList!.querySelectorAll(".input-port.over, .input-port.incompatible, .port.over, .port.incompatible")
+      .forEach((candidate) => candidate.classList.remove("over", "incompatible"));
+    const hit = graphPortAt(pointer.clientX, pointer.clientY);
+    if (hit && hit.element !== element) {
+      const plan = planGraphConnection(snapshot.instances, from, hit.port);
+      hit.element.classList.add(plan.ok ? "over" : "incompatible");
+    }
+    scheduleWires();
+  };
+  const cleanup = (): void => {
+    cancelGraphWireDrag = null;
+    window.removeEventListener("pointermove", move);
+    window.removeEventListener("pointerup", up);
+    window.removeEventListener("pointercancel", cancel);
+    if (element.hasPointerCapture(event.pointerId)) element.releasePointerCapture(event.pointerId);
+    clearGraphWire();
+  };
+  const up = (pointer: PointerEvent): void => {
+    if (pointer.pointerId !== event.pointerId) return;
+    const hit = moved ? graphPortAt(pointer.clientX, pointer.clientY) : null;
+    cleanup();
+    if (!moved) return;
+    suppressClickUntil = performance.now() + 140;
+    if (hit) {
+      const plan = planGraphConnection(snapshot.instances, from, hit.port);
+      if (plan.ok) {
+        connectInput(plan.connection.targetId, plan.connection.inputName, plan.connection.sourceId);
+      } else if (plan.reason === "cycle") {
+        showToast(t("toast.connectCycle"));
+      } else if (plan.reason === "type") {
+        const source = from.kind === "output" ? from : hit.port;
+        const target = from.kind === "input" ? from : hit.port;
+        showToast(t("toast.connectType", { source: source.valueType, target: target.valueType }));
+      } else {
+        showToast(t("graph.invalidDrop"));
+      }
+    } else if (from.kind === "input") {
+      disconnectInput(from.nodeId, from.name);
+    } else {
+      openGraphQuickAdd(pointer.clientX, pointer.clientY, from.nodeId);
+    }
+  };
+  const cancel = (pointer: PointerEvent): void => {
+    if (pointer.pointerId === event.pointerId) cleanup();
+  };
+  element.setPointerCapture(event.pointerId);
+  cancelGraphWireDrag = cleanup;
+  window.addEventListener("pointermove", move);
+  window.addEventListener("pointerup", up);
+  window.addEventListener("pointercancel", cancel);
+}
+
 function renderInstances(): void {
   if (impactedVariableId !== null && !variableById(impactedVariableId)) impactedVariableId = null;
   impactedIds = impactedVariableId === null
@@ -2221,7 +2474,7 @@ function renderInstances(): void {
     const row = document.createElement("div");
     row.className = "row";
     row.addEventListener("pointerdown", (event) => {
-      if ((event.target as HTMLElement).closest(".port")) return;
+      if ((event.target as HTMLElement).closest(".port, button")) return;
       startNodeDrag(event, instance);
     });
     const name = document.createElement("span");
@@ -2230,15 +2483,24 @@ function renderInstances(): void {
     const output = document.createElement("span");
     output.className = "meta port";
     output.textContent = outputType(instance) ?? "?";
-    output.draggable = true;
-    output.title = "Drag this output onto an input field";
+    output.title = t("graph.connectHint");
     output.dataset.instanceId = String(instance.id);
     output.dataset.port = "out";
-    output.addEventListener("dragstart", (event) => {
-      event.dataTransfer?.setData("text/plain", String(instance.id));
-      if (event.dataTransfer) event.dataTransfer.effectAllowed = "link";
+    output.addEventListener("pointerdown", (event) => {
+      const port = graphPortFromElement(output);
+      if (port) startGraphPortDrag(event, output, port);
     });
-    row.append(name, output);
+    const settings = document.createElement("button");
+    settings.type = "button";
+    settings.className = "node-settings";
+    settings.textContent = "⚙";
+    settings.title = t("graph.editProperties");
+    settings.setAttribute("aria-label", settings.title);
+    settings.addEventListener("click", (event) => {
+      event.stopPropagation();
+      inspectGraphNode(instance.id);
+    });
+    row.append(name, settings, output);
 
     const meta = document.createElement("div");
     meta.className = "meta";
@@ -2250,7 +2512,7 @@ function renderInstances(): void {
     const overload = activeOverload(instance);
     if (overload) {
       for (const input of inputsFor(instance)) {
-        if (input.value_type !== "field" && input.value_type !== "mesh") continue;
+        if (!["field", "mesh", "list", "any"].includes(input.value_type)) continue;
         const inputRow = document.createElement("div");
         inputRow.className = "input-row";
         const port = document.createElement("span");
@@ -2262,17 +2524,15 @@ function renderInstances(): void {
           ? instanceById(instance.inputs[input.name])
           : undefined;
         if (source) port.classList.add("connected");
-        port.title = `input ${input.name} (${input.value_type})`;
-        port.addEventListener("dragover", (event) => {
-          event.preventDefault();
-          port.classList.add("over");
+        port.title = source ? t("graph.rewire") : `${input.name} · ${input.value_type}`;
+        port.addEventListener("pointerdown", (event) => {
+          const graphPort = graphPortFromElement(port);
+          if (graphPort) startGraphPortDrag(event, port, graphPort);
         });
-        port.addEventListener("dragleave", () => port.classList.remove("over"));
-        port.addEventListener("drop", (event) => {
+        port.addEventListener("contextmenu", (event) => {
           event.preventDefault();
-          port.classList.remove("over");
-          const raw = event.dataTransfer?.getData("text/plain") ?? "";
-          connectInput(instance.id, input.name, Number(raw));
+          event.stopPropagation();
+          disconnectInput(instance.id, input.name);
         });
         const label = document.createElement("span");
         label.textContent = source ? `${input.name} ← ${displayName(source)}` : `${input.name} —`;
@@ -2284,17 +2544,13 @@ function renderInstances(): void {
         addRow.className = "input-row add-port-row";
         const addPort = document.createElement("span");
         addPort.className = "input-port add-port";
-        addPort.title = "Drop a field here to add a port";
-        addPort.addEventListener("dragover", (event) => {
-          event.preventDefault();
-          addPort.classList.add("over");
-        });
-        addPort.addEventListener("dragleave", () => addPort.classList.remove("over"));
-        addPort.addEventListener("drop", (event) => {
-          event.preventDefault();
-          addPort.classList.remove("over");
-          const raw = event.dataTransfer?.getData("text/plain") ?? "";
-          connectInput(instance.id, nextFreePortName(instance), Number(raw));
+        addPort.title = t("graph.addField");
+        addPort.dataset.instanceId = String(instance.id);
+        addPort.dataset.input = nextFreePortName(instance);
+        addPort.dataset.valueType = "field";
+        addPort.addEventListener("pointerdown", (event) => {
+          const graphPort = graphPortFromElement(addPort);
+          if (graphPort) startGraphPortDrag(event, addPort, graphPort);
         });
         const label = document.createElement("span");
         label.textContent = t("graph.addField");
@@ -2326,6 +2582,10 @@ function renderInstances(): void {
       renderInstances();
       renderProperties();
       updatePreviewAfterSelection(previousTargetId);
+    });
+    card.addEventListener("dblclick", (event) => {
+      if ((event.target as HTMLElement).closest(".port, .input-port, .node-settings")) return;
+      inspectGraphNode(instance.id);
     });
     instanceList!.append(card);
   }
@@ -2799,7 +3059,8 @@ function renderWires(): void {
       if (
         input.value_type !== "field" &&
         input.value_type !== "mesh" &&
-        input.value_type !== "list"
+        input.value_type !== "list" &&
+        input.value_type !== "any"
       ) {
         continue;
       }
@@ -2819,19 +3080,34 @@ function renderWires(): void {
       const y1 = (from.top + from.height / 2 - worldRect.top) / zoom;
       const x2 = (to.left - worldRect.left) / zoom;
       const y2 = (to.top + to.height / 2 - worldRect.top) / zoom;
-      const control = Math.max(28, Math.abs(x2 - x1) * 0.45);
-      const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
-      path.setAttribute(
-        "d",
-        `M ${x1} ${y1} C ${x1 + control} ${y1}, ${x2 - control} ${y2}, ${x2} ${y2}`,
-      );
-      path.setAttribute("class", input.value_type === "mesh" ? "wire mesh" : "wire");
-      path.addEventListener("click", (event) => {
+      const curve = bezierWire({ x: x1, y: y1 }, { x: x2, y: y2 });
+      const hit = document.createElementNS("http://www.w3.org/2000/svg", "path");
+      hit.setAttribute("d", curve);
+      hit.setAttribute("class", "wire-hit");
+      const disconnect = (event: Event): void => {
+        event.preventDefault();
         event.stopPropagation();
         disconnectInput(instance.id, input.name);
-      });
-      svg.append(path);
+      };
+      hit.addEventListener("dblclick", disconnect);
+      hit.addEventListener("contextmenu", disconnect);
+      const title = document.createElementNS("http://www.w3.org/2000/svg", "title");
+      title.textContent = t("graph.disconnect");
+      hit.append(title);
+      const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+      path.setAttribute("d", curve);
+      path.setAttribute("class", input.value_type === "mesh" ? "wire mesh" : "wire");
+      svg.append(hit, path);
     }
+  }
+  if (activeGraphWire?.element.isConnected) {
+    const anchor = graphPortAnchor(activeGraphWire.element, activeGraphWire.from);
+    const from = activeGraphWire.from.kind === "output" ? anchor : activeGraphWire.pointer;
+    const to = activeGraphWire.from.kind === "output" ? activeGraphWire.pointer : anchor;
+    const preview = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    preview.setAttribute("d", bezierWire(from, to));
+    preview.setAttribute("class", "wire-preview");
+    svg.append(preview);
   }
 }
 
@@ -3029,7 +3305,7 @@ function syncPolicy(): void {
 function saveJson(): void {
   flushNotebookHistory();
   synchronizeVariableParams();
-  const blob = new Blob([JSON.stringify(snapshot, null, 2)], { type: "application/json" });
+  const blob = new Blob([JSON.stringify({ ...snapshot, graph_layout: exportGraphLayout(nodePositions) }, null, 2)], { type: "application/json" });
   const url = URL.createObjectURL(blob);
   const anchor = document.createElement("a");
   anchor.href = url;
@@ -3046,6 +3322,7 @@ async function loadJson(file: File): Promise<void> {
       throw new Error("expected a version 1 Notebook snapshot");
     }
     validateVariableSnapshot(parsed);
+    const savedPositions = importGraphLayout(parsed.graph_layout, new Set(parsed.instances.map((instance) => instance.id)));
     flushNotebookHistory();
     snapshot = parsed;
     synchronizeVariableParams();
@@ -3056,6 +3333,7 @@ async function loadJson(file: File): Promise<void> {
     framed = false;
     errorId = null;
     nodePositions.clear();
+    for (const [id, position] of savedPositions) nodePositions.set(id, position);
     syncPolicy();
     renderAll();
     fitCanvas();
@@ -3079,6 +3357,7 @@ async function main(): Promise<void> {
     syncLanguageThemeControls();
     if (statusState) statusLabel!.textContent = t(statusState.key, statusState.vars);
     renderAll();
+    if (!graphQuickAdd!.classList.contains("hidden")) renderGraphQuickResults();
     syncWorkspaceModeControls();
   });
   languageButton!.addEventListener("click", () => toggleLanguage());
@@ -3102,9 +3381,40 @@ async function main(): Promise<void> {
   showNotebookButton!.addEventListener("click", () => setWorkspaceMode("notebook"));
   showGraphButton!.addEventListener("click", () => setWorkspaceMode("graph"));
   graphExpandButton!.addEventListener("click", () => setGraphExpanded(!graphExpanded));
+  graphPropertiesButton!.addEventListener("click", () => setGraphPropertiesOpen(!graphPropertiesOpen));
   notebookAddButton!.addEventListener("click", () => {
+    if (workspaceMode === "graph") {
+      const rect = notebookBody!.getBoundingClientRect();
+      openGraphQuickAdd(rect.left + rect.width / 2, rect.top + Math.min(180, rect.height / 2));
+      return;
+    }
     if (!document.body.classList.contains("show-palette")) togglePaletteButton?.click();
     blockSearch?.focus();
+  });
+  graphQuickSearch!.addEventListener("input", renderGraphQuickResults);
+  graphQuickSearch!.addEventListener("keydown", (event) => {
+    const options = [...graphQuickResults!.querySelectorAll<HTMLButtonElement>(".graph-quick-option")];
+    if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      closeGraphQuickAdd();
+      return;
+    }
+    if (event.key === "Enter") {
+      event.preventDefault();
+      options.find((option) => option.classList.contains("active"))?.click();
+      return;
+    }
+    if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+    event.preventDefault();
+    const index = options.findIndex((option) => option.classList.contains("active"));
+    const delta = event.key === "ArrowDown" ? 1 : -1;
+    const next = (index + delta + options.length) % options.length;
+    options.forEach((option, at) => {
+      option.classList.toggle("active", at === next);
+      option.setAttribute("aria-selected", String(at === next));
+    });
+    options[next]?.scrollIntoView({ block: "nearest" });
   });
   previewTargetSelect!.addEventListener("change", () => {
     previewTargetId = previewTargetSelect!.value === "" ? null : Number(previewTargetSelect!.value);
@@ -3233,13 +3543,14 @@ async function main(): Promise<void> {
   );
   notebook!.addEventListener("pointerdown", (event) => {
     if (workspaceMode !== "graph") return;
+    const target = event.target as Element;
+    if (target.closest("#graph-quick-add")) return;
     if (event.button === 0) {
-      const target = event.target as HTMLElement;
-      if (notebookBody!.contains(target) && !target.closest(".instance")) {
+      if (notebookBody!.contains(target) && !target.closest(".instance, .wire-hit")) {
         startMarquee(event);
       }
     }
-    if (event.button !== 1 && event.button !== 2) return;
+    if (event.button !== 1) return;
     event.preventDefault();
     panStart = {
       x: event.clientX,
@@ -3264,7 +3575,15 @@ async function main(): Promise<void> {
   notebook!.addEventListener("pointerup", endPan);
   notebook!.addEventListener("pointercancel", endPan);
   notebook!.addEventListener("contextmenu", (event) => {
-    if (workspaceMode === "graph") event.preventDefault();
+    if (workspaceMode !== "graph") return;
+    event.preventDefault();
+    const target = event.target as Element;
+    if (target.closest(".instance, .wire-hit, #graph-quick-add")) return;
+    openGraphQuickAdd(event.clientX, event.clientY);
+  });
+  window.addEventListener("pointerdown", (event) => {
+    if (graphQuickAdd!.classList.contains("hidden")) return;
+    if (!graphQuickAdd!.contains(event.target as Node)) closeGraphQuickAdd();
   });
   zoomIn!.addEventListener("click", () => zoomAtCenter(1.15));
   zoomOut!.addEventListener("click", () => zoomAtCenter(1 / 1.15));
@@ -3282,6 +3601,21 @@ async function main(): Promise<void> {
   window.addEventListener("keydown", (event) => {
     const target = event.target as HTMLElement | null;
     const editing = Boolean(target?.closest("input, textarea, select"));
+    if (event.key === "Escape" && cancelGraphWireDrag) {
+      event.preventDefault();
+      cancelGraphWireDrag();
+      return;
+    }
+    if (event.key === "Escape" && !graphQuickAdd!.classList.contains("hidden")) {
+      event.preventDefault();
+      closeGraphQuickAdd();
+      return;
+    }
+    if (event.key === "Escape" && graphPropertiesOpen) {
+      event.preventDefault();
+      setGraphPropertiesOpen(false);
+      return;
+    }
     if (event.key === "Escape" && document.body.classList.contains("show-variables")) {
       event.preventDefault();
       showVariablesPanel(false);
@@ -3297,6 +3631,13 @@ async function main(): Promise<void> {
       if (!document.body.classList.contains("show-palette")) togglePaletteButton?.click();
       blockSearch?.focus();
       blockSearch?.select();
+      return;
+    }
+    if (!editing && workspaceMode === "graph" && !event.ctrlKey && !event.metaKey &&
+        event.key.toLowerCase() === "a") {
+      event.preventDefault();
+      const rect = notebookBody!.getBoundingClientRect();
+      openGraphQuickAdd(rect.left + rect.width / 2, rect.top + rect.height / 2);
       return;
     }
     if (!editing && (event.key === "Delete" || event.key === "Backspace")) {
