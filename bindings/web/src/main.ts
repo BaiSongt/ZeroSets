@@ -33,6 +33,14 @@ import {
   type Theme,
 } from "./theme";
 import { acceptsOutput, createsCycle, planAutoConnections } from "./workflow";
+import {
+  affectedBlockIds,
+  convertQuantity,
+  materializeBoundNumbers,
+  unitFamily,
+  validVariableName,
+  type NamedVariable,
+} from "./variables";
 
 type ValueType = "field" | "mesh" | "number" | "vector" | "boolean" | "text" | "list" | "any";
 type UnitKind = "any" | "length" | "angle" | "unitless";
@@ -83,6 +91,7 @@ type Instance = {
   params: Record<string, ParamValue>;
   inputs: Record<string, number>;
   ports?: string[];
+  variable_refs?: Record<string, number>;
   enabled: boolean;
   manual: boolean;
 };
@@ -91,6 +100,8 @@ type Snapshot = {
   version: number;
   next_id: number;
   update_policy?: "auto" | "manual";
+  variables?: NamedVariable[];
+  next_variable_id?: number;
   instances: Instance[];
 };
 
@@ -111,6 +122,11 @@ const paletteList = document.querySelector<HTMLElement>("#palette-list");
 const paletteCount = document.querySelector<HTMLElement>("#palette-count");
 const blockSearch = document.querySelector<HTMLInputElement>("#block-search");
 const togglePaletteButton = document.querySelector<HTMLButtonElement>("#toggle-palette");
+const toggleVariablesButton = document.querySelector<HTMLButtonElement>("#toggle-variables");
+const variablesPanel = document.querySelector<HTMLElement>("#variables-panel");
+const variablesList = document.querySelector<HTMLElement>("#variables-list");
+const variablesCount = document.querySelector<HTMLElement>("#variables-count");
+const variableAddButton = document.querySelector<HTMLButtonElement>("#variable-add");
 const togglePropertiesButton = document.querySelector<HTMLButtonElement>("#toggle-properties");
 const properties = document.querySelector<HTMLElement>("#properties");
 const propertiesBadge = document.querySelector<HTMLElement>("#properties-badge");
@@ -155,6 +171,11 @@ const themeLabel = document.querySelector<HTMLElement>("#theme-label");
 if (
   !viewport ||
   !previewTargetSelect ||
+  !toggleVariablesButton ||
+  !variablesPanel ||
+  !variablesList ||
+  !variablesCount ||
+  !variableAddButton ||
   !paletteList ||
   !notebook ||
   !notebookBody ||
@@ -203,6 +224,8 @@ let snapshot: Snapshot = { version: 1, next_id: 1, instances: [], update_policy:
 let selectedId: number | null = null;
 let selectedIds = new Set<number>();
 let previewTargetId: number | null = null;
+let impactedVariableId: number | null = null;
+let impactedIds = new Set<number>();
 let errorId: number | null = null;
 let autoUpdate = true;
 let suppressClickUntil = 0;
@@ -481,7 +504,7 @@ function diagnosticCaret(entry: DiagnosticEntry): string | null {
 
 function readDiagnostics(instanceId: number): DiagnosticEntry[] {
   try {
-    const json = notebook_diagnostics(JSON.stringify(snapshot), BigInt(instanceId));
+    const json = notebook_diagnostics(kernelSnapshotJson(), BigInt(instanceId));
     const entries = JSON.parse(json) as DiagnosticEntry[];
     return entries.filter((entry) => entry.severity === "error");
   } catch (error) {
@@ -785,6 +808,223 @@ function defaultsFor(overload: Overload): Record<string, ParamValue> {
   return params;
 }
 
+function namedVariables(): NamedVariable[] {
+  return snapshot.variables ?? [];
+}
+
+function variableById(id: number): NamedVariable | undefined {
+  return namedVariables().find((variable) => variable.id === id);
+}
+
+function boundVariable(instance: Instance, name: string): NamedVariable | undefined {
+  const id = instance.variable_refs?.[name];
+  return id === undefined ? undefined : variableById(id);
+}
+
+function numberParameter(instance: Instance, input: InputDef): { value: number; unit: Unit } {
+  const param = instance.params[input.name] ?? defaultParam(input);
+  return param && "Number" in param ? param.Number : { value: 0, unit: "unitless" };
+}
+
+function variableMatchesInput(variable: NamedVariable, input: InputDef, unit: Unit): boolean {
+  const kind = unitFamily(variable.unit);
+  return (input.unit === "any" || input.unit === kind) && kind === unitFamily(unit);
+}
+
+function variableValueAllowed(variable: NamedVariable, next: number): boolean {
+  if (convertQuantity(next, variable.unit, variable.unit) === null) return false;
+  for (const instance of snapshot.instances) {
+    for (const [name, id] of Object.entries(instance.variable_refs ?? {})) {
+      if (id !== variable.id) continue;
+      const input = inputsFor(instance).find((candidate) => candidate.name === name);
+      if (!input || convertQuantity(next, variable.unit, numberParameter(instance, input).unit) === null) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+// 参数值始终物化为 Number，旧版 WASM 与旧版 Notebook 仍可理解快照中的数值。
+function synchronizeVariableParams(): void {
+  for (const instance of snapshot.instances) {
+    for (const [name, variableId] of Object.entries(instance.variable_refs ?? {})) {
+      const variable = variableById(variableId);
+      const input = inputsFor(instance).find((candidate) => candidate.name === name);
+      if (!variable || !input || input.value_type !== "number") {
+        throw new Error(t("variables.invalidSnapshot"));
+      }
+      const param = numberParameter(instance, input);
+      if (!variableMatchesInput(variable, input, param.unit)) {
+        throw new Error(t("variables.invalidSnapshot"));
+      }
+      if (!instance.params[name]) instance.params[name] = { Number: param };
+    }
+  }
+  if (!materializeBoundNumbers(snapshot.instances, namedVariables())) {
+    throw new Error(t("variables.invalidValue"));
+  }
+}
+
+// 发送给 Rust 的数据严格保持 NotebookSnapshot v1 结构，不携带 UI 变量元数据。
+function kernelSnapshotJson(): string {
+  synchronizeVariableParams();
+  return JSON.stringify({
+    version: snapshot.version,
+    next_id: snapshot.next_id,
+    update_policy: snapshot.update_policy,
+    instances: snapshot.instances.map((instance) => ({
+      id: instance.id,
+      def_id: instance.def_id,
+      name: instance.name,
+      overload: instance.overload,
+      params: instance.params,
+      inputs: instance.inputs,
+      enabled: instance.enabled,
+      manual: instance.manual,
+    })),
+  });
+}
+
+function validateVariableSnapshot(value: Snapshot): void {
+  if (value.next_variable_id !== undefined &&
+      (!Number.isSafeInteger(value.next_variable_id) || value.next_variable_id < 1)) {
+    throw new Error(t("variables.invalidSnapshot"));
+  }
+  if (value.variables === undefined) {
+    if (value.instances.some((instance) => Object.keys(instance.variable_refs ?? {}).length > 0)) {
+      throw new Error(t("variables.invalidSnapshot"));
+    }
+    return;
+  }
+  if (!Array.isArray(value.variables)) throw new Error(t("variables.invalidSnapshot"));
+  const ids = new Set<number>();
+  const names = new Set<string>();
+  const validUnits = new Set<Unit>(["unitless", "millimeter", "centimeter", "meter", "inch", "radian", "degree"]);
+  for (const variable of value.variables) {
+    if (!Number.isSafeInteger(variable.id) || variable.id < 1 ||
+        !validVariableName(variable.name) || names.has(variable.name) || ids.has(variable.id) ||
+        !Number.isFinite(variable.value) || !validUnits.has(variable.unit)) {
+      throw new Error(t("variables.invalidSnapshot"));
+    }
+    ids.add(variable.id);
+    names.add(variable.name);
+    if (convertQuantity(variable.value, variable.unit, variable.unit) === null) {
+      throw new Error(t("variables.invalidSnapshot"));
+    }
+  }
+  for (const instance of value.instances) {
+    for (const [name, id] of Object.entries(instance.variable_refs ?? {})) {
+      const variable = value.variables.find((candidate) => candidate.id === id);
+      const input = inputsFor(instance).find((candidate) => candidate.name === name);
+      if (!variable || !input || input.value_type !== "number" ||
+          !variableMatchesInput(variable, input, numberParameter(instance, input).unit) ||
+          convertQuantity(variable.value, variable.unit, numberParameter(instance, input).unit) === null) {
+        throw new Error(t("variables.invalidSnapshot"));
+      }
+    }
+  }
+}
+
+function uniqueVariableName(base: string): string {
+  const prefix = validVariableName(base) ? base : "variable";
+  let result = prefix;
+  let suffix = 1;
+  while (namedVariables().some((variable) => variable.name === result)) {
+    result = `${prefix}${suffix++}`;
+  }
+  return result;
+}
+
+function showVariablesPanel(open: boolean): void {
+  document.body.classList.toggle("show-variables", open);
+  toggleVariablesButton!.classList.toggle("active", open);
+  if (open) {
+    document.body.classList.remove("show-palette", "show-properties");
+    togglePaletteButton?.classList.remove("active");
+    togglePropertiesButton?.classList.remove("active");
+  } else if (impactedVariableId !== null) {
+    impactedVariableId = null;
+    renderInstances();
+  }
+}
+
+function selectVariableImpact(id: number | null): void {
+  if (impactedVariableId === id) return;
+  impactedVariableId = id;
+  renderInstances();
+}
+
+function addNamedVariable(from?: { instance: Instance; input: InputDef }): void {
+  const current = from
+    ? numberParameter(from.instance, from.input)
+    : { value: 1, unit: "millimeter" as Unit };
+  if (convertQuantity(current.value, current.unit, current.unit) === null) {
+    showToast(t("variables.invalidValue"));
+    return;
+  }
+  flushNotebookHistory();
+  const id = Math.max(snapshot.next_variable_id ?? 1, 1, ...namedVariables().map((variable) => variable.id + 1));
+  const variable: NamedVariable = {
+    id,
+    name: uniqueVariableName(from?.input.name ?? "variable"),
+    value: current.value,
+    unit: current.unit,
+  };
+  snapshot.next_variable_id = id + 1;
+  snapshot.variables = [...namedVariables(), variable];
+  if (from) {
+    from.instance.variable_refs = { ...from.instance.variable_refs, [from.input.name]: id };
+  }
+  synchronizeVariableParams();
+  impactedVariableId = id;
+  commitHistory();
+  renderAll();
+  if (from) scheduleBuild();
+  showVariablesPanel(true);
+  variablesList!.querySelector<HTMLInputElement>(`.variable-card[data-variable-id="${id}"] .variable-name-row input`)?.focus();
+}
+
+function bindNumberVariable(instance: Instance, input: InputDef, variableId: number | null): void {
+  flushNotebookHistory();
+  if (variableId === null) {
+    const refs = { ...instance.variable_refs };
+    delete refs[input.name];
+    instance.variable_refs = refs;
+    impactedVariableId = null;
+  } else {
+    const variable = variableById(variableId);
+    if (!variable || !variableMatchesInput(variable, input, numberParameter(instance, input).unit) ||
+        convertQuantity(variable.value, variable.unit, numberParameter(instance, input).unit) === null) {
+      showToast(t("variables.invalidSnapshot"));
+      return;
+    }
+    instance.variable_refs = { ...instance.variable_refs, [input.name]: variableId };
+    impactedVariableId = variableId;
+  }
+  synchronizeVariableParams();
+  commitHistory();
+  renderAll();
+  scheduleBuild();
+}
+
+function removeNamedVariable(id: number): void {
+  flushNotebookHistory();
+  synchronizeVariableParams();
+  snapshot.variables = namedVariables().filter((variable) => variable.id !== id);
+  for (const instance of snapshot.instances) {
+    const refs = { ...instance.variable_refs };
+    for (const [name, ref] of Object.entries(refs)) {
+      if (ref === id) delete refs[name];
+    }
+    if (instance.variable_refs) instance.variable_refs = refs;
+  }
+  if (impactedVariableId === id) impactedVariableId = null;
+  commitHistory();
+  renderAll();
+  scheduleBuild();
+}
+
 function layoutNodes(): void {
   const ids = new Set(snapshot.instances.map((instance) => instance.id));
   const depths = new Map<number, number>();
@@ -880,6 +1120,7 @@ function scheduleNotebookHistory(): void {
 
 function restoreHistory(entry: HistoryEntry): void {
   snapshot = structuredClone(entry.snapshot);
+  synchronizeVariableParams();
   nodePositions.clear();
   for (const [id, position] of entry.positions) {
     nodePositions.set(id, { ...position });
@@ -1394,6 +1635,125 @@ function setGraphExpanded(expanded: boolean): void {
   });
 }
 
+function renderVariables(): void {
+  const list = variablesList!;
+  list.replaceChildren();
+  variablesCount!.textContent = String(namedVariables().length);
+  if (namedVariables().length === 0) {
+    const empty = document.createElement("p");
+    empty.className = "variable-empty";
+    empty.textContent = t("variables.empty");
+    list.append(empty);
+    return;
+  }
+
+  for (const variable of namedVariables()) {
+    const card = document.createElement("section");
+    card.className = "variable-card";
+    card.dataset.variableId = String(variable.id);
+    const nameRow = document.createElement("div");
+    nameRow.className = "variable-name-row";
+    const name = document.createElement("input");
+    name.type = "text";
+    name.value = variable.name;
+    name.setAttribute("aria-label", t("variables.binding"));
+    name.addEventListener("focus", () => selectVariableImpact(variable.id));
+    name.addEventListener("change", () => {
+      const next = name.value.trim();
+      if (!validVariableName(next)) {
+        showToast(t("variables.invalidName"));
+        name.value = variable.name;
+        return;
+      }
+      if (namedVariables().some((entry) => entry.id !== variable.id && entry.name === next)) {
+        showToast(t("variables.duplicateName", { name: next }));
+        name.value = variable.name;
+        return;
+      }
+      if (next === variable.name) return;
+      flushNotebookHistory();
+      variable.name = next;
+      commitHistory();
+      renderAll();
+    });
+    const id = document.createElement("span");
+    id.className = "variable-id";
+    id.textContent = `#${variable.id}`;
+    nameRow.append(name, id);
+
+    const valueRow = document.createElement("div");
+    valueRow.className = "variable-value-row";
+    const value = document.createElement("input");
+    value.type = "number";
+    value.step = "any";
+    value.value = String(variable.value);
+    value.setAttribute("aria-label", variable.name);
+    value.addEventListener("focus", () => selectVariableImpact(variable.id));
+    value.addEventListener("input", () => {
+      if (value.value.trim() === "") return;
+      const next = Number(value.value);
+      if (!variableValueAllowed(variable, next)) return;
+      variable.value = next;
+      synchronizeVariableParams();
+      const impactChanged = impactedVariableId !== variable.id;
+      selectVariableImpact(variable.id);
+      if (!impactChanged) renderNotebookList();
+      renderProperties();
+      scheduleBuild();
+      scheduleNotebookHistory();
+    });
+    value.addEventListener("change", () => {
+      if (value.value.trim() === "" || !variableValueAllowed(variable, Number(value.value))) {
+        showToast(t("variables.invalidValue"));
+        value.value = String(variable.value);
+      }
+      flushNotebookHistory();
+    });
+    const unit = document.createElement("select");
+    for (const optionUnit of unitsFor(unitFamily(variable.unit))) {
+      const option = document.createElement("option");
+      option.value = optionUnit;
+      option.textContent = unitLabel(optionUnit);
+      unit.append(option);
+    }
+    unit.value = variable.unit;
+    unit.addEventListener("change", () => {
+      const nextUnit = unit.value as Unit;
+      const converted = convertQuantity(variable.value, variable.unit, nextUnit);
+      if (converted === null) {
+        unit.value = variable.unit;
+        showToast(t("variables.invalidValue"));
+        return;
+      }
+      flushNotebookHistory();
+      variable.value = converted;
+      variable.unit = nextUnit;
+      synchronizeVariableParams();
+      impactedVariableId = variable.id;
+      commitHistory();
+      renderAll();
+      scheduleBuild();
+    });
+    valueRow.append(value, unit);
+
+    const foot = document.createElement("div");
+    foot.className = "variable-foot";
+    const affected = document.createElement("span");
+    affected.textContent = t("variables.affected", {
+      count: affectedBlockIds(snapshot.instances, variable.id).size,
+    });
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.textContent = "✕";
+    remove.title = t("variables.remove");
+    remove.setAttribute("aria-label", remove.title);
+    remove.addEventListener("click", () => removeNamedVariable(variable.id));
+    foot.append(affected, remove);
+    card.append(nameRow, valueRow, foot);
+    list.append(card);
+  }
+}
+
 function renderNotebookList(): void {
   const list = notebookList!;
   const scrollTop = list.scrollTop;
@@ -1420,6 +1780,7 @@ function renderNotebookList(): void {
     item.classList.toggle("selected", selectedId === instance.id);
     item.classList.toggle("error", errorId === instance.id);
     item.classList.toggle("disabled", !instance.enabled);
+    item.classList.toggle("variable-impact", impactedIds.has(instance.id));
 
     const head = document.createElement("button");
     head.type = "button";
@@ -1529,6 +1890,7 @@ function renderNotebookList(): void {
           const param = current && "Number" in current
             ? current.Number
             : { value: 0, unit: "unitless" as Unit };
+          const bound = boundVariable(instance, input.name);
           const row = document.createElement("div");
           row.className = "notebook-quick-row";
           const label = document.createElement("label");
@@ -1537,6 +1899,8 @@ function renderNotebookList(): void {
           value.type = "number";
           value.step = "any";
           value.value = String(param.value);
+          value.disabled = Boolean(bound);
+          if (bound) value.title = t("variables.drivenBy", { name: bound.name });
           value.dataset.notebookParam = input.name;
           value.dataset.instanceId = String(instance.id);
           value.addEventListener("input", () => {
@@ -1548,7 +1912,22 @@ function renderNotebookList(): void {
             scheduleNotebookHistory();
           });
           value.addEventListener("change", flushNotebookHistory);
-          row.append(label, value);
+          row.append(label);
+          if (bound) {
+            const jump = document.createElement("button");
+            jump.type = "button";
+            jump.className = "notebook-variable-tag";
+            jump.textContent = `↳ ${bound.name}`;
+            jump.title = t("variables.drivenBy", { name: bound.name });
+            jump.addEventListener("click", () => {
+              showVariablesPanel(true);
+              variablesList!.querySelector<HTMLInputElement>(
+                `.variable-card[data-variable-id="${bound.id}"] .variable-value-row input`,
+              )?.focus();
+            });
+            row.append(jump);
+          }
+          row.append(value);
           detail.append(row);
         }
       }
@@ -1668,6 +2047,10 @@ function renderPalette(): void {
 }
 
 function renderInstances(): void {
+  if (impactedVariableId !== null && !variableById(impactedVariableId)) impactedVariableId = null;
+  impactedIds = impactedVariableId === null
+    ? new Set<number>()
+    : affectedBlockIds(snapshot.instances, impactedVariableId);
   renderPalette();
   renderNotebookList();
   renderPreviewTargets();
@@ -1693,6 +2076,7 @@ function renderInstances(): void {
     card.style.top = `${position.y}px`;
     if (selectedIds.has(instance.id)) card.classList.add("selected");
     if (instance.id === errorId) card.classList.add("error");
+    if (impactedIds.has(instance.id)) card.classList.add("variable-impact");
 
     const row = document.createElement("div");
     row.className = "row";
@@ -1849,18 +2233,21 @@ function renderParam(
 
   if (input.value_type === "number") {
     const param = current && "Number" in current ? current.Number : { value: 0, unit: "unitless" as Unit };
+    const bound = boundVariable(instance, input.name);
     const wrapper = document.createElement("div");
     wrapper.className = "with-unit";
     const value = document.createElement("input");
     value.type = "number";
     value.step = "any";
     value.value = String(param.value);
+    value.disabled = Boolean(bound);
     const unit = makeUnitSelect(input.unit, param.unit, (nextUnit) => {
       const valueNow = Number(value.value) || 0;
       instance.params[input.name] = { Number: { value: valueNow, unit: nextUnit } };
       commitHistory();
       scheduleBuild();
     });
+    unit.disabled = Boolean(bound);
     value.addEventListener("input", () => {
       instance.params[input.name] = {
         Number: { value: Number(value.value) || 0, unit: unit.value as Unit },
@@ -1871,6 +2258,42 @@ function renderParam(
     value.addEventListener("change", commitHistory);
     wrapper.append(value, unit);
     parent.append(wrapper);
+
+    const bindingRow = document.createElement("div");
+    bindingRow.className = "param-variable";
+    const binding = document.createElement("select");
+    binding.setAttribute("aria-label", t("variables.binding"));
+    const local = document.createElement("option");
+    local.value = "";
+    local.textContent = t("variables.unbound");
+    binding.append(local);
+    for (const variable of namedVariables()) {
+      if (!variableMatchesInput(variable, input, param.unit) ||
+          convertQuantity(variable.value, variable.unit, param.unit) === null) continue;
+      const option = document.createElement("option");
+      option.value = String(variable.id);
+      option.textContent = variable.name;
+      binding.append(option);
+    }
+    binding.value = bound ? String(bound.id) : "";
+    binding.addEventListener("change", () => {
+      bindNumberVariable(instance, input, binding.value === "" ? null : Number(binding.value));
+    });
+    const create = document.createElement("button");
+    create.type = "button";
+    create.textContent = "+";
+    create.title = t("variables.createForParam");
+    create.setAttribute("aria-label", create.title);
+    create.disabled = Boolean(bound);
+    create.addEventListener("click", () => addNamedVariable({ instance, input }));
+    bindingRow.append(binding, create);
+    parent.append(bindingRow);
+    if (bound) {
+      const hint = document.createElement("p");
+      hint.className = "param-variable-hint";
+      hint.textContent = t("variables.drivenBy", { name: bound.name });
+      parent.append(hint);
+    }
     return;
   }
 
@@ -1958,6 +2381,7 @@ function renderParam(
         for (const [name, param] of template.params ?? []) {
           instance.params[name] = structuredClone(param);
         }
+        synchronizeVariableParams();
         commitHistory();
         renderProperties();
         scheduleBuild();
@@ -2130,8 +2554,19 @@ function renderProperties(): void {
           delete instance.inputs[inputName];
         }
       }
-      renderInstances();
-      renderProperties();
+      const refs = { ...instance.variable_refs };
+      for (const [name, id] of Object.entries(refs)) {
+        const input = inputsFor(instance).find((candidate) => candidate.name === name);
+        const variable = variableById(id);
+        if (!input || input.value_type !== "number" || !variable ||
+            !variableMatchesInput(variable, input, numberParameter(instance, input).unit) ||
+            convertQuantity(variable.value, variable.unit, numberParameter(instance, input).unit) === null) {
+          delete refs[name];
+        }
+      }
+      if (instance.variable_refs) instance.variable_refs = refs;
+      synchronizeVariableParams();
+      renderAll();
       commitHistory();
       scheduleBuild();
     });
@@ -2272,6 +2707,7 @@ function scheduleWires(): void {
 
 function renderAll(): void {
   renderInstances();
+  renderVariables();
   renderProperties();
 }
 
@@ -2371,7 +2807,7 @@ function build(): void {
     if (token !== buildToken) return;
     const started = performance.now();
     try {
-      const bytes = notebook_eval(JSON.stringify(snapshot), BigInt(target.id));
+      const bytes = notebook_eval(kernelSnapshotJson(), BigInt(target.id));
       const { geometry, vertices, triangles, featureEdges } = decodeMesh(bytes);
       if (currentMesh) scene.remove(currentMesh);
       if (currentFeatures) {
@@ -2451,6 +2887,8 @@ function syncPolicy(): void {
 }
 
 function saveJson(): void {
+  flushNotebookHistory();
+  synchronizeVariableParams();
   const blob = new Blob([JSON.stringify(snapshot, null, 2)], { type: "application/json" });
   const url = URL.createObjectURL(blob);
   const anchor = document.createElement("a");
@@ -2467,7 +2905,11 @@ async function loadJson(file: File): Promise<void> {
     if (parsed.version !== 1 || !Array.isArray(parsed.instances)) {
       throw new Error("expected a version 1 Notebook snapshot");
     }
+    validateVariableSnapshot(parsed);
+    flushNotebookHistory();
     snapshot = parsed;
+    synchronizeVariableParams();
+    impactedVariableId = null;
     previewTargetId = null;
     selectedId = snapshot.instances[0]?.id ?? null;
     selectedIds = new Set(selectedId === null ? [] : [selectedId]);
@@ -2548,7 +2990,9 @@ async function main(): Promise<void> {
     if (currentFeatures) currentFeatures.visible = featureToggle!.checked;
   });
   templateButton!.addEventListener("click", () => {
+    flushNotebookHistory();
     snapshot = JSON.parse(notebook_template()) as Snapshot;
+    impactedVariableId = null;
     previewTargetId = null;
     selectedId = snapshot.instances[snapshot.instances.length - 1]?.id ?? null;
     selectedIds = new Set(selectedId === null ? [] : [selectedId]);
@@ -2562,7 +3006,9 @@ async function main(): Promise<void> {
     build();
   });
   newButton!.addEventListener("click", () => {
+    flushNotebookHistory();
     snapshot = { version: 1, next_id: 1, instances: [], update_policy: "auto" };
+    impactedVariableId = null;
     previewTargetId = null;
     clearMeshPreview();
     selectedId = null;
@@ -2592,10 +3038,15 @@ async function main(): Promise<void> {
     blockSearch.blur();
     renderPalette();
   });
+  toggleVariablesButton!.addEventListener("click", () => {
+    showVariablesPanel(!document.body.classList.contains("show-variables"));
+  });
+  variableAddButton!.addEventListener("click", () => addNamedVariable());
   togglePaletteButton?.addEventListener("click", () => {
     const open = document.body.classList.toggle("show-palette");
     togglePaletteButton.classList.toggle("active", open);
     if (open) {
+      showVariablesPanel(false);
       document.body.classList.remove("show-properties");
       togglePropertiesButton?.classList.remove("active");
     }
@@ -2604,6 +3055,7 @@ async function main(): Promise<void> {
     const open = document.body.classList.toggle("show-properties");
     togglePropertiesButton.classList.toggle("active", open);
     if (open) {
+      showVariablesPanel(false);
       document.body.classList.remove("show-palette");
       togglePaletteButton?.classList.remove("active");
     }
@@ -2687,6 +3139,11 @@ async function main(): Promise<void> {
   window.addEventListener("keydown", (event) => {
     const target = event.target as HTMLElement | null;
     const editing = Boolean(target?.closest("input, textarea, select"));
+    if (event.key === "Escape" && document.body.classList.contains("show-variables")) {
+      event.preventDefault();
+      showVariablesPanel(false);
+      return;
+    }
     if (event.key === "Escape" && graphExpanded) {
       event.preventDefault();
       setGraphExpanded(false);
