@@ -42,6 +42,16 @@ pnpm dev
 ```
 
 The dev server serves the Notebook prototype at `http://127.0.0.1:5173/`.
+
+### V0.5 命名变量与参数绑定
+
+1. 在 Inspector 的数值参数旁点击 `+`，可由当前值创建一个命名变量；也可从 Ribbon 的「变量」浮层中新建。
+2. 在另一个数值参数的「变量绑定」下拉框里选择同一个变量，即可共同驱动多个 Block。只允许相同量纲的绑定；长度和角度单位可自动换算。
+3. 修改变量会更新所有绑定值，并高亮受影响的下游 Block。删除变量会解除绑定、保留最后的数值；支持 Undo/Redo。
+4. JSON 快照保留可选的 `variables` 和 `variable_refs` 元数据，WASM 仍接收原版 v1 Number 参数，无需修改 Rust 内核。
+
+本地变量/Graph 测试：在 `bindings/web` 下运行 `pnpm test:unit`（不使用 GitHub CI）。
+
 The UI uses localStorage keys `zeroset.theme`, `zeroset.language`, and
 `zeroset.panel-layout` for persisted preferences and panel widths.
 
