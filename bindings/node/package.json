@@ -1,0 +1,13 @@
+{
+  "name": "@zeroset/kernel",
+  "version": "0.1.0",
+  "description": "Native napi-rs binding for the ZeroSet implicit geometry kernel",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "files": ["index.js", "index.d.ts", "*.node"],
+  "scripts": {
+    "demo": "node demo.cjs",
+    "smoke": "node smoke.cjs"
+  },
+  "license": "MIT OR Apache-2.0"
+}

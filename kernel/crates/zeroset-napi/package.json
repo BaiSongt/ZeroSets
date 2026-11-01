@@ -1,0 +1,23 @@
+{
+  "name": "@zeroset/kernel-native",
+  "version": "0.1.0",
+  "private": true,
+  "main": "index.js",
+  "types": "index.d.ts",
+  "napi": {
+    "name": "zeroset-kernel",
+    "triples": {
+      "defaults": true
+    }
+  },
+  "scripts": {
+    "build": "napi build --platform --release --output-dir ../../../bindings/node",
+    "build:debug": "napi build --platform --output-dir ../../../bindings/node"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^3.0.0"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": ["@napi-rs/cli"]
+  }
+}

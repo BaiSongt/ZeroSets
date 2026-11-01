@@ -1,0 +1,23 @@
+# Rust kernel build output
+kernel/target/
+**/target/
+
+# JavaScript dependencies and build output
+**/node_modules/
+bindings/web/pkg/
+bindings/web/dist/
+
+# Generated native binary and mesh artifacts
+*.node
+*.dll
+*.stl
+kernel/notebook-demo.json
+
+# napi-rs filesystem reconciliation leftovers
+.napi-rs-filesystem-reconciliation*
+
+# IDE and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

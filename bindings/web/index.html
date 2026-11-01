@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ZeroSet · Notebook</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <header id="toolbar">
+      <div class="titlebar">
+        <div class="brand">
+          <span class="brand-mark">Z</span>
+          <span class="brand-copy">
+            <strong>ZeroSet</strong>
+            <span data-i18n="brand.notebook">Notebook</span>
+          </span>
+        </div>
+        <nav class="doc-tabs" aria-label="Workspace">
+          <button class="doc-tab active" type="button" data-i18n="doc.notebook">Notebook</button>
+          <button class="doc-tab" type="button" disabled data-i18n="doc.mesh">Mesh</button>
+        </nav>
+        <span class="titlebar-spacer"></span>
+        <div class="titlebar-tools">
+          <button
+            id="toggle-language"
+            class="title-button"
+            type="button"
+            data-i18n-title="action.language"
+            title="Switch language"
+          >
+            <svg class="icon" viewBox="0 0 16 16" aria-hidden="true">
+              <circle cx="8" cy="8" r="5.6" />
+              <path d="M2.6 8h10.8M8 2.4c1.7 1.6 2.6 3.4 2.6 5.6S9.7 12 8 13.6C6.3 12 5.4 10.2 5.4 8S6.3 4 8 2.4Z" />
+            </svg>
+            <span id="language-label">EN</span>
+          </button>
+          <button
+            id="toggle-theme"
+            class="title-button"
+            type="button"
+            data-i18n-title="action.theme"
+            title="Switch light/dark theme"
+          >
+            <svg class="icon theme-icon theme-icon-moon" viewBox="0 0 16 16" aria-hidden="true">
+              <path d="M12.7 9.4A5.4 5.4 0 0 1 6.6 3.3 5.2 5.2 0 1 0 12.7 9.4Z" />
+            </svg>
+            <svg class="icon theme-icon theme-icon-sun" viewBox="0 0 16 16" aria-hidden="true">
+              <circle cx="8" cy="8" r="2.7" />
+              <path d="M8 1.8v1.4M8 12.8v1.4M1.8 8h1.4M12.8 8h1.4M3.6 3.6l1 1M11.4 11.4l1 1M12.4 3.6l-1 1M4.6 11.4l-1 1" />
+            </svg>
+            <span id="theme-label">Light</span>
+          </button>
+        </div>
+        <div class="titlebar-meta"><span class="status-led"></span><span data-i18n="titlebar.session">LOCAL SESSION</span></div>
+      </div>
+
+      <div class="ribbon" role="toolbar" aria-label="Notebook commands">
+        <section class="ribbon-group">
+          <div class="ribbon-items">
+            <button id="new" class="ribbon-button" type="button" title="New notebook">
+              <svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><rect x="3" y="2.4" width="10" height="11.2" rx="1.4"/><path d="M8 5v6M5 8h6"/></svg>
+              <span data-i18n="action.new">New</span>
+            </button>
+            <button id="template" class="ribbon-button" type="button" title="Load starter template">
+              <svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 1.8l5.2 3L8 7.8 2.8 4.8 8 1.8Z"/><path d="M2.8 7.6 8 10.6l5.2-3M2.8 10.4 8 13.4l5.2-3"/></svg>
+              <span data-i18n="action.template">Template</span>
+            </button>
+            <button id="save" class="ribbon-button" type="button" title="Save notebook as JSON">
+              <svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2v7.4M5.2 6.6 8 9.4l2.8-2.8M2.8 13h10.4"/></svg>
+              <span data-i18n="action.save">Save</span>
+            </button>
+            <button id="load-button" class="ribbon-button" type="button" title="Load notebook JSON">
+              <svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 13V5.6M5.2 8.4 8 5.6l2.8 2.8M2.8 2.8h10.4"/></svg>
+              <span data-i18n="action.load">Load</span>
+            </button>
+            <input id="load-file" type="file" accept="application/json,.json" hidden />
+          </div>
+          <span class="ribbon-caption" data-i18n="ribbon.file">File</span>
+        </section>
+
+        <section class="ribbon-group">
+          <div class="ribbon-items">
+            <button id="undo" class="ribbon-button compact" type="button" title="Undo (Ctrl+Z)" disabled>
+              <svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M5.2 4.4 2.6 7l2.6 2.6"/><path d="M2.8 7h5.7a4.2 4.2 0 0 1 0 8.4H6.4"/></svg>
+              <span data-i18n="action.undo">Undo</span>
+            </button>
+            <button id="redo" class="ribbon-button compact" type="button" title="Redo (Ctrl+Shift+Z / Ctrl+Y)" disabled>
+              <svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><path d="m10.8 4.4 2.6 2.6-2.6 2.6"/><path d="M13.2 7H7.5a4.2 4.2 0 0 0 0 8.4h2.1"/></svg>
+              <span data-i18n="action.redo">Redo</span>
+            </button>
+          </div>
+          <span class="ribbon-caption" data-i18n="ribbon.edit">Edit</span>
+        </section>
+
+        <section class="ribbon-group">
+          <div class="ribbon-items">
+            <label class="ribbon-toggle" title="Rebuild after parameter or link changes">
+              <input id="auto" type="checkbox" checked />
+              <svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M3 8a5 5 0 0 1 8.5-3.5L13 6M13 3v3h-3"/><path d="M13 8a5 5 0 0 1-8.5 3.5L3 10M3 13v-3h3"/></svg>
+              <span data-i18n="action.auto">Auto</span>
+            </label>
+            <label class="ribbon-toggle" title="Show feature edges from the kernel">
+              <input id="show-features" type="checkbox" checked />
+              <svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M1.8 8S4 3.9 8 3.9 14.2 8 14.2 8 12 12.1 8 12.1 1.8 8 1.8 8Z"/><circle cx="8" cy="8" r="1.8"/></svg>
+              <span data-i18n="action.features">Features</span>
+            </label>
+            <button id="build" class="ribbon-button primary" type="button" title="Build the selected Mesh block">
+              <svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 1.8 13.2 4.8v6.4L8 14.2 2.8 11.2V4.8L8 1.8Z"/><path d="M2.8 4.8 8 8l5.2-3.2M8 8v6.2"/></svg>
+              <span data-i18n="action.build">Build Mesh</span>
+            </button>
+          </div>
+          <span class="ribbon-caption" data-i18n="ribbon.build">Build</span>
+        </section>
+
+        <section class="ribbon-group grow">
+          <div class="ribbon-items">
+            <button id="zoom-out" class="ribbon-button icon-only" type="button" title="Zoom out">
+              <svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M3 8h10"/></svg>
+            </button>
+            <span id="zoom-label">100%</span>
+            <button id="zoom-in" class="ribbon-button icon-only" type="button" title="Zoom in">
+              <svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3v10M3 8h10"/></svg>
+            </button>
+            <span class="ribbon-divider"></span>
+            <button id="fit" class="ribbon-button compact" type="button" title="Fit graph">
+              <svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M2.5 6V2.5H6M10 2.5h3.5V6M13.5 10v3.5H10M6 13.5H2.5V10"/></svg>
+              <span data-i18n="action.fit">Fit</span>
+            </button>
+            <button id="arrange" class="ribbon-button compact" type="button" title="Auto layout by dependency depth">
+              <svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><rect x="2.5" y="2.5" width="4" height="4" rx=".6"/><rect x="9.5" y="2.5" width="4" height="4" rx=".6"/><rect x="2.5" y="9.5" width="4" height="4" rx=".6"/><rect x="9.5" y="9.5" width="4" height="4" rx=".6"/></svg>
+              <span data-i18n="action.arrange">Arrange</span>
+            </button>
+            <span class="ribbon-divider"></span>
+            <button id="toggle-palette" class="ribbon-button compact panel-toggle" type="button" title="Show or hide the block library">
+              <svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><rect x="2.5" y="2.5" width="11" height="11" rx="1"/><path d="M6 2.5v11M6 6h7.5M6 9.5h7.5"/></svg>
+              <span data-i18n="action.library">Library</span>
+            </button>
+            <button id="toggle-properties" class="ribbon-button compact panel-toggle" type="button" title="Show or hide the inspector">
+              <svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M3 5h10M3 8h10M3 11h10"/><circle cx="6" cy="5" r="1.3"/><circle cx="10" cy="8" r="1.3"/><circle cx="5" cy="11" r="1.3"/></svg>
+              <span data-i18n="action.inspector">Inspector</span>
+            </button>
+          </div>
+          <span class="ribbon-caption" data-i18n="ribbon.view">View</span>
+        </section>
+      </div>
+    </header>
+
+    <aside id="palette" class="panel">
+      <div class="panel-head">
+        <div class="panel-heading">
+          <span class="panel-eyebrow" data-i18n="panel.library">Library</span>
+          <h2 data-i18n="panel.blocks">Blocks</h2>
+        </div>
+        <span id="palette-count" class="panel-count"></span>
+      </div>
+      <div class="panel-search">
+        <svg class="search-icon" viewBox="0 0 16 16" aria-hidden="true"><circle cx="7" cy="7" r="4.2"/><path d="m10.2 10.2 3 3"/></svg>
+        <input id="block-search" type="search" placeholder="Search blocks" data-i18n-placeholder="search.blocks" autocomplete="off" spellcheck="false" />
+        <kbd>/</kbd>
+      </div>
+      <div id="palette-list" class="panel-body"></div>
+      <div class="panel-foot"><span data-i18n="panel.add">Click to add to notebook</span><span data-i18n="panel.drag">Drag to reorder</span></div>
+    </aside>
+    <div id="palette-resizer" class="resizer" data-resize="palette" title="Drag to resize; double-click to reset"></div>
+
+    <section id="notebook" class="panel">
+      <div class="panel-head">
+        <div class="panel-heading">
+          <span class="panel-eyebrow" data-i18n="panel.workspace">Workspace</span>
+          <h2 data-i18n="panel.notebook">Notebook</h2>
+        </div>
+        <span class="panel-chip" data-i18n="panel.graph">Graph</span>
+      </div>
+      <div id="notebook-body">
+        <div id="graph-world">
+          <svg id="wires" aria-hidden="true"></svg>
+          <div id="instance-list"></div>
+        </div>
+        <div id="marquee" class="hidden"></div>
+      </div>
+    </section>
+    <div id="graph-resizer" class="resizer" data-resize="graph" title="Drag to resize; double-click to reset"></div>
+
+    <main id="viewport">
+      <div class="viewport-hud">
+        <span class="viewport-chip" data-i18n="viewport.perspective">Perspective</span>
+        <span class="viewport-hint" data-i18n="viewport.controls">Orbit: drag · Pan: middle / right · Zoom: wheel</span>
+      </div>
+    </main>
+
+    <div id="properties-resizer" class="resizer" data-resize="properties" title="Drag to resize; double-click to reset"></div>
+    <aside id="properties" class="panel">
+      <div class="panel-head">
+        <div class="panel-heading">
+          <span class="panel-eyebrow" data-i18n="panel.inspector">Inspector</span>
+          <h2 data-i18n="panel.properties">Properties</h2>
+        </div>
+        <span id="properties-badge" class="panel-count">—</span>
+      </div>
+      <div id="property-body" class="panel-body"><p class="hint" data-i18n="properties.select">Select a block.</p></div>
+      <div id="diagnostics" class="hidden" role="status" aria-live="polite"></div>
+    </aside>
+
+    <footer id="statusbar">
+      <div class="status-left"><span class="status-led"></span><span id="status" data-i18n="status.loading">wasm loading…</span></div>
+      <div class="status-right"><span data-i18n="status.autoUpdate">Auto-update</span><span class="status-sep">·</span><span data-i18n="status.resizable">Resizable panels</span><span class="status-sep">·</span><span>wasm 0.1.0</span></div>
+    </footer>
+
+    <div id="toast" class="hidden"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
+

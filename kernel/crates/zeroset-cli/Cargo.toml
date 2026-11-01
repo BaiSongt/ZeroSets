@@ -1,0 +1,17 @@
+[package]
+name = "zeroset-cli"
+description = "Command-line driver for the ZeroSet implicit kernel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "zs"
+path = "src/main.rs"
+
+[dependencies]
+zeroset-core = { path = "../zeroset-core" }
+zeroset-gpu = { path = "../zeroset-gpu" }
+serde_json.workspace = true
