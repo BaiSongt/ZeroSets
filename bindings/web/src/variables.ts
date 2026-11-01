@@ -2,7 +2,7 @@
 export type VariableUnit =
   | "unitless" | "millimeter" | "centimeter" | "meter" | "inch" | "radian" | "degree";
 
-export type NamedVariable = { id: number; name: string; value: number; unit: VariableUnit };
+export type NamedVariable = { id: number; name: string; value: number; unit: VariableUnit; expression?: string };
 export type BoundNode = {
   id: number;
   inputs: Record<string, number>;
@@ -60,11 +60,12 @@ export function validVariableName(name: string): boolean {
 }
 
 // 命名变量影响直接绑定的 Block 及全部下游依赖；DAG 异常时也能安全终止。
-export function affectedBlockIds(nodes: readonly BoundNode[], variableId: number): Set<number> {
+export function affectedBlockIds(nodes: readonly BoundNode[], variableIds: number | ReadonlySet<number>): Set<number> {
+  const ids = typeof variableIds === "number" ? new Set([variableIds]) : variableIds;
   const affected = new Set<number>();
   const pending: number[] = [];
   for (const node of nodes) {
-    if (Object.values(node.variable_refs ?? {}).includes(variableId)) {
+    if (Object.values(node.variable_refs ?? {}).some((id) => ids.has(id))) {
       affected.add(node.id);
       pending.push(node.id);
     }

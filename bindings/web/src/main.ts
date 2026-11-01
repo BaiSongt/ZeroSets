@@ -34,6 +34,13 @@ import {
 } from "./theme";
 import { acceptsOutput, createsCycle, planAutoConnections } from "./workflow";
 import {
+  dependentVariableIds,
+  FormulaError,
+  renameFormulaReference,
+  resolveVariableExpressions,
+  type VariableResolution,
+} from "./expressions";
+import {
   affectedBlockIds,
   convertQuantity,
   materializeBoundNumbers,
@@ -226,6 +233,7 @@ let selectedIds = new Set<number>();
 let previewTargetId: number | null = null;
 let impactedVariableId: number | null = null;
 let impactedIds = new Set<number>();
+let formulaDependencies = new Map<number, Set<number>>();
 let errorId: number | null = null;
 let autoUpdate = true;
 let suppressClickUntil = 0;
@@ -831,22 +839,71 @@ function variableMatchesInput(variable: NamedVariable, input: InputDef, unit: Un
   return (input.unit === "any" || input.unit === kind) && kind === unitFamily(unit);
 }
 
-function variableValueAllowed(variable: NamedVariable, next: number): boolean {
-  if (convertQuantity(next, variable.unit, variable.unit) === null) return false;
+function formulaErrorMessage(error: unknown): string {
+  if (error instanceof FormulaError) {
+    return t(`variables.formula.${error.code}`, { detail: error.detail });
+  }
+  return String(error);
+}
+
+// 先在副本上计算全部公式和参数边界，成功后再原子地提交变量对象。
+function evaluateVariableDraft(draft: NamedVariable[]): { resolved: NamedVariable[]; evaluation: VariableResolution } {
+  const evaluation = resolveVariableExpressions(draft);
+  const resolved = draft.map((variable) => ({ ...variable, value: evaluation.values.get(variable.id)! }));
+  const byId = new Map(resolved.map((variable) => [variable.id, variable]));
   for (const instance of snapshot.instances) {
     for (const [name, id] of Object.entries(instance.variable_refs ?? {})) {
-      if (id !== variable.id) continue;
+      const variable = byId.get(id);
       const input = inputsFor(instance).find((candidate) => candidate.name === name);
-      if (!input || convertQuantity(next, variable.unit, numberParameter(instance, input).unit) === null) {
-        return false;
+      if (!variable || !input || input.value_type !== "number") {
+        throw new Error(t("variables.invalidSnapshot"));
+      }
+      const unit = numberParameter(instance, input).unit;
+      if (!variableMatchesInput(variable, input, unit)) throw new FormulaError("dimension", variable.name, id);
+      if (convertQuantity(variable.value, variable.unit, unit) === null) {
+        throw new FormulaError("overflow", variable.name, id);
       }
     }
   }
-  return true;
+  return { resolved, evaluation };
+}
+
+function applyVariableDraft(draft: NamedVariable[]): void {
+  const { resolved, evaluation } = evaluateVariableDraft(draft);
+  const existing = new Map(namedVariables().map((variable) => [variable.id, variable]));
+  snapshot.variables = resolved.map((variable) => {
+    const current = existing.get(variable.id);
+    return current ? Object.assign(current, variable) : variable;
+  });
+  formulaDependencies = evaluation.dependencies;
+  synchronizeVariableParams();
+}
+
+function refreshDerivedVariableFields(): void {
+  for (const variable of namedVariables()) {
+    const input = variablesList!.querySelector<HTMLInputElement>(
+      `.variable-card[data-variable-id="${variable.id}"] .variable-value-row input`,
+    );
+    if (input && document.activeElement !== input) input.value = String(variable.value);
+  }
+}
+
+function highlightVariableCards(): void {
+  const affected = impactedVariableId === null
+    ? new Set<number>()
+    : dependentVariableIds(formulaDependencies, impactedVariableId);
+  for (const card of variablesList!.querySelectorAll<HTMLElement>(".variable-card")) {
+    card.classList.toggle("variable-impact", affected.has(Number(card.dataset.variableId)));
+  }
 }
 
 // 参数值始终物化为 Number，旧版 WASM 与旧版 Notebook 仍可理解快照中的数值。
 function synchronizeVariableParams(): void {
+  const evaluation = resolveVariableExpressions(namedVariables());
+  formulaDependencies = evaluation.dependencies;
+  for (const variable of namedVariables()) {
+    variable.value = evaluation.values.get(variable.id)!;
+  }
   for (const instance of snapshot.instances) {
     for (const [name, variableId] of Object.entries(instance.variable_refs ?? {})) {
       const variable = variableById(variableId);
@@ -904,7 +961,8 @@ function validateVariableSnapshot(value: Snapshot): void {
   for (const variable of value.variables) {
     if (!Number.isSafeInteger(variable.id) || variable.id < 1 ||
         !validVariableName(variable.name) || names.has(variable.name) || ids.has(variable.id) ||
-        !Number.isFinite(variable.value) || !validUnits.has(variable.unit)) {
+        !Number.isFinite(variable.value) || !validUnits.has(variable.unit) ||
+        (variable.expression !== undefined && typeof variable.expression !== "string")) {
       throw new Error(t("variables.invalidSnapshot"));
     }
     ids.add(variable.id);
@@ -913,13 +971,19 @@ function validateVariableSnapshot(value: Snapshot): void {
       throw new Error(t("variables.invalidSnapshot"));
     }
   }
+  let computed: VariableResolution;
+  try {
+    computed = resolveVariableExpressions(value.variables);
+  } catch (error) {
+    throw new Error(`${t("variables.invalidSnapshot")} ${formulaErrorMessage(error)}`);
+  }
   for (const instance of value.instances) {
     for (const [name, id] of Object.entries(instance.variable_refs ?? {})) {
       const variable = value.variables.find((candidate) => candidate.id === id);
       const input = inputsFor(instance).find((candidate) => candidate.name === name);
       if (!variable || !input || input.value_type !== "number" ||
           !variableMatchesInput(variable, input, numberParameter(instance, input).unit) ||
-          convertQuantity(variable.value, variable.unit, numberParameter(instance, input).unit) === null) {
+          convertQuantity(computed.values.get(variable.id)!, variable.unit, numberParameter(instance, input).unit) === null) {
         throw new Error(t("variables.invalidSnapshot"));
       }
     }
@@ -946,6 +1010,7 @@ function showVariablesPanel(open: boolean): void {
   } else if (impactedVariableId !== null) {
     impactedVariableId = null;
     renderInstances();
+    highlightVariableCards();
   }
 }
 
@@ -953,6 +1018,7 @@ function selectVariableImpact(id: number | null): void {
   if (impactedVariableId === id) return;
   impactedVariableId = id;
   renderInstances();
+  highlightVariableCards();
 }
 
 function addNamedVariable(from?: { instance: Instance; input: InputDef }): void {
@@ -1009,6 +1075,12 @@ function bindNumberVariable(instance: Instance, input: InputDef, variableId: num
 }
 
 function removeNamedVariable(id: number): void {
+  const derived = dependentVariableIds(formulaDependencies, id);
+  const users = namedVariables().filter((variable) => variable.id !== id && derived.has(variable.id));
+  if (users.length > 0) {
+    showToast(t("variables.formula.inUse", { names: users.map((variable) => variable.name).join(", ") }));
+    return;
+  }
   flushNotebookHistory();
   synchronizeVariableParams();
   snapshot.variables = namedVariables().filter((variable) => variable.id !== id);
@@ -1019,6 +1091,7 @@ function removeNamedVariable(id: number): void {
     }
     if (instance.variable_refs) instance.variable_refs = refs;
   }
+  synchronizeVariableParams();
   if (impactedVariableId === id) impactedVariableId = null;
   commitHistory();
   renderAll();
@@ -1672,7 +1745,19 @@ function renderVariables(): void {
       }
       if (next === variable.name) return;
       flushNotebookHistory();
-      variable.name = next;
+      try {
+        applyVariableDraft(namedVariables().map((entry) => ({
+          ...entry,
+          name: entry.id === variable.id ? next : entry.name,
+          expression: entry.expression
+            ? renameFormulaReference(entry.expression, variable.name, next)
+            : undefined,
+        })));
+      } catch (error) {
+        showToast(formulaErrorMessage(error));
+        name.value = variable.name;
+        return;
+      }
       commitHistory();
       renderAll();
     });
@@ -1687,23 +1772,30 @@ function renderVariables(): void {
     value.type = "number";
     value.step = "any";
     value.value = String(variable.value);
+    value.disabled = Boolean(variable.expression?.trim());
+    if (value.disabled) value.title = t("variables.formula.computed");
     value.setAttribute("aria-label", variable.name);
     value.addEventListener("focus", () => selectVariableImpact(variable.id));
     value.addEventListener("input", () => {
       if (value.value.trim() === "") return;
       const next = Number(value.value);
-      if (!variableValueAllowed(variable, next)) return;
-      variable.value = next;
-      synchronizeVariableParams();
+      try {
+        applyVariableDraft(namedVariables().map((entry) => entry.id === variable.id
+          ? { ...entry, value: next }
+          : { ...entry }));
+      } catch {
+        return;
+      }
       const impactChanged = impactedVariableId !== variable.id;
       selectVariableImpact(variable.id);
       if (!impactChanged) renderNotebookList();
       renderProperties();
+      refreshDerivedVariableFields();
       scheduleBuild();
       scheduleNotebookHistory();
     });
     value.addEventListener("change", () => {
-      if (value.value.trim() === "" || !variableValueAllowed(variable, Number(value.value))) {
+      if (value.value.trim() === "" || Number(value.value) !== variable.value) {
         showToast(t("variables.invalidValue"));
         value.value = String(variable.value);
       }
@@ -1726,9 +1818,15 @@ function renderVariables(): void {
         return;
       }
       flushNotebookHistory();
-      variable.value = converted;
-      variable.unit = nextUnit;
-      synchronizeVariableParams();
+      try {
+        applyVariableDraft(namedVariables().map((entry) => entry.id === variable.id
+          ? { ...entry, value: converted, unit: nextUnit }
+          : { ...entry }));
+      } catch (error) {
+        unit.value = variable.unit;
+        showToast(formulaErrorMessage(error));
+        return;
+      }
       impactedVariableId = variable.id;
       commitHistory();
       renderAll();
@@ -1736,11 +1834,52 @@ function renderVariables(): void {
     });
     valueRow.append(value, unit);
 
+    const formulaRow = document.createElement("div");
+    formulaRow.className = "variable-formula-row";
+    const fx = document.createElement("span");
+    fx.className = "variable-fx";
+    fx.textContent = "ƒx";
+    fx.title = t("variables.formula.label");
+    const formulaInput = document.createElement("input");
+    formulaInput.type = "text";
+    formulaInput.className = "variable-formula-input";
+    formulaInput.spellcheck = false;
+    formulaInput.placeholder = t("variables.formula.placeholder");
+    formulaInput.value = variable.expression ?? "";
+    formulaInput.setAttribute("aria-label", t("variables.formula.label"));
+    formulaInput.addEventListener("focus", () => selectVariableImpact(variable.id));
+    const formulaError = document.createElement("p");
+    formulaError.className = "variable-formula-error";
+    formulaError.setAttribute("role", "status");
+    formulaInput.addEventListener("input", () => {
+      formulaInput.classList.remove("invalid");
+      formulaError.textContent = "";
+    });
+    formulaInput.addEventListener("change", () => {
+      const next = formulaInput.value.trim();
+      if (next === (variable.expression ?? "")) return;
+      flushNotebookHistory();
+      try {
+        applyVariableDraft(namedVariables().map((entry) => entry.id === variable.id
+          ? { ...entry, expression: next || undefined }
+          : { ...entry }));
+      } catch (error) {
+        formulaInput.classList.add("invalid");
+        formulaError.textContent = formulaErrorMessage(error);
+        return;
+      }
+      impactedVariableId = variable.id;
+      commitHistory();
+      renderAll();
+      scheduleBuild();
+    });
+    formulaRow.append(fx, formulaInput);
+
     const foot = document.createElement("div");
     foot.className = "variable-foot";
     const affected = document.createElement("span");
     affected.textContent = t("variables.affected", {
-      count: affectedBlockIds(snapshot.instances, variable.id).size,
+      count: affectedBlockIds(snapshot.instances, dependentVariableIds(formulaDependencies, variable.id)).size,
     });
     const remove = document.createElement("button");
     remove.type = "button";
@@ -1749,9 +1888,10 @@ function renderVariables(): void {
     remove.setAttribute("aria-label", remove.title);
     remove.addEventListener("click", () => removeNamedVariable(variable.id));
     foot.append(affected, remove);
-    card.append(nameRow, valueRow, foot);
+    card.append(nameRow, valueRow, formulaRow, formulaError, foot);
     list.append(card);
   }
+  highlightVariableCards();
 }
 
 function renderNotebookList(): void {
@@ -2050,7 +2190,7 @@ function renderInstances(): void {
   if (impactedVariableId !== null && !variableById(impactedVariableId)) impactedVariableId = null;
   impactedIds = impactedVariableId === null
     ? new Set<number>()
-    : affectedBlockIds(snapshot.instances, impactedVariableId);
+    : affectedBlockIds(snapshot.instances, dependentVariableIds(formulaDependencies, impactedVariableId));
   renderPalette();
   renderNotebookList();
   renderPreviewTargets();
@@ -2948,6 +3088,7 @@ async function main(): Promise<void> {
   catalog = JSON.parse(block_catalog()) as BlockDef[];
   customTemplates = JSON.parse(custom_templates()) as CustomTemplate[];
   snapshot = JSON.parse(notebook_template()) as Snapshot;
+  synchronizeVariableParams();
   selectedId = snapshot.instances[snapshot.instances.length - 1]?.id ?? null;
   selectedIds = new Set(selectedId === null ? [] : [selectedId]);
   syncPolicy();
@@ -2992,6 +3133,7 @@ async function main(): Promise<void> {
   templateButton!.addEventListener("click", () => {
     flushNotebookHistory();
     snapshot = JSON.parse(notebook_template()) as Snapshot;
+    synchronizeVariableParams();
     impactedVariableId = null;
     previewTargetId = null;
     selectedId = snapshot.instances[snapshot.instances.length - 1]?.id ?? null;
@@ -3008,6 +3150,7 @@ async function main(): Promise<void> {
   newButton!.addEventListener("click", () => {
     flushNotebookHistory();
     snapshot = { version: 1, next_id: 1, instances: [], update_policy: "auto" };
+    synchronizeVariableParams();
     impactedVariableId = null;
     previewTargetId = null;
     clearMeshPreview();
