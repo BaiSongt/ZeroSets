@@ -32,6 +32,7 @@ import {
   toggleTheme,
   type Theme,
 } from "./theme";
+import { acceptsOutput, createsCycle, planAutoConnections } from "./workflow";
 
 type ValueType = "field" | "mesh" | "number" | "vector" | "boolean" | "text" | "list" | "any";
 type UnitKind = "any" | "length" | "angle" | "unitless";
@@ -104,6 +105,7 @@ type DiagnosticEntry = {
 };
 
 const viewport = document.querySelector<HTMLElement>("#viewport");
+const previewTargetSelect = document.querySelector<HTMLSelectElement>("#preview-target");
 const palette = document.querySelector<HTMLElement>("#palette");
 const paletteList = document.querySelector<HTMLElement>("#palette-list");
 const paletteCount = document.querySelector<HTMLElement>("#palette-count");
@@ -152,6 +154,7 @@ const themeLabel = document.querySelector<HTMLElement>("#theme-label");
 
 if (
   !viewport ||
+  !previewTargetSelect ||
   !paletteList ||
   !notebook ||
   !notebookBody ||
@@ -199,6 +202,7 @@ let customTemplates: CustomTemplate[] = [];
 let snapshot: Snapshot = { version: 1, next_id: 1, instances: [], update_policy: "auto" };
 let selectedId: number | null = null;
 let selectedIds = new Set<number>();
+let previewTargetId: number | null = null;
 let errorId: number | null = null;
 let autoUpdate = true;
 let suppressClickUntil = 0;
@@ -964,6 +968,7 @@ function startNodeDrag(event: PointerEvent, instance: Instance): void {
   const position = nodePositions.get(instance.id);
   if (!position) return;
   event.preventDefault();
+  const previousTargetId = meshTarget()?.id ?? null;
 
   if (!selectedIds.has(instance.id)) {
     selectedIds.clear();
@@ -975,7 +980,10 @@ function startNodeDrag(event: PointerEvent, instance: Instance): void {
     node.classList.toggle("selected", selectedIds.has(Number(node.dataset.id)));
   }
   renderNotebookList();
+  renderPreviewTargets();
+  renderPalette();
   renderProperties();
+  updatePreviewAfterSelection(previousTargetId);
 
   const entries = [...selectedIds]
     .map((id) => {
@@ -1066,6 +1074,7 @@ function startMarquee(event: PointerEvent): void {
   };
 
   const onUp = (): void => {
+    const previousTargetId = meshTarget()?.id ?? null;
     notebook!.removeEventListener("pointermove", onMove);
     notebook!.removeEventListener("pointerup", onUp);
     notebook!.removeEventListener("pointercancel", onUp);
@@ -1076,6 +1085,7 @@ function startMarquee(event: PointerEvent): void {
         selectedId = null;
         renderInstances();
         renderProperties();
+        updatePreviewAfterSelection(previousTargetId);
       }
       return;
     }
@@ -1104,6 +1114,7 @@ function startMarquee(event: PointerEvent): void {
     selectedId = [...selectedIds][0] ?? null;
     renderInstances();
     renderProperties();
+    updatePreviewAfterSelection(previousTargetId);
   };
 
   notebook!.addEventListener("pointermove", onMove);
@@ -1111,9 +1122,19 @@ function startMarquee(event: PointerEvent): void {
   notebook!.addEventListener("pointercancel", onUp);
 }
 
-function addBlock(def: BlockDef): void {
+function autoConnectionsFor(def: BlockDef): Record<string, number> {
+  const sources = [...selectedIds]
+    .map((id) => instanceById(id))
+    .filter((instance): instance is Instance => instance !== undefined)
+    .map((instance) => ({ id: instance.id, output: outputType(instance) }))
+    .filter((source): source is { id: number; output: ValueType } => source.output !== undefined);
+  return planAutoConnections(def.overloads[0]?.inputs ?? [], sources);
+}
+
+function addBlock(def: BlockDef, connectSelected = false): void {
   const overload = def.overloads[0];
   if (!overload) return;
+  const inputs = connectSelected ? autoConnectionsFor(def) : {};
   const id = snapshot.next_id++;
   snapshot.instances.push({
     id,
@@ -1121,7 +1142,7 @@ function addBlock(def: BlockDef): void {
     name: `${def.name} ${id}`,
     overload: overload.name,
     params: defaultsFor(overload),
-    inputs: {},
+    inputs,
     enabled: true,
     manual: false,
   });
@@ -1131,6 +1152,8 @@ function addBlock(def: BlockDef): void {
   commitHistory();
   renderAll();
   scheduleBuild();
+  if (workspaceMode === "notebook") notebookList!.scrollTop = notebookList!.scrollHeight;
+  else fitCanvas();
 }
 
 function deleteInstance(id: number): void {
@@ -1242,7 +1265,7 @@ function alignSelected(mode: "left" | "top" | "distribute-x" | "distribute-y"): 
 function connectInput(targetId: number, inputName: string, sourceId: number): boolean {
   const target = instanceById(targetId);
   const source = instanceById(sourceId);
-  if (!target || !source || target.id === source.id) return false;
+  if (!target || !source) return false;
   let input = inputsFor(target).find((candidate) => candidate.name === inputName);
   if (!input && isFreePortBlock(target)) {
     input = { name: inputName, value_type: "field", required: false, unit: "any", default: null };
@@ -1250,8 +1273,12 @@ function connectInput(targetId: number, inputName: string, sourceId: number): bo
   if (!input) return false;
   const sourceType = outputType(source);
   if (!sourceType) return false;
-  if (input.value_type !== "any" && sourceType !== input.value_type) {
+  if (!acceptsOutput(input.value_type, sourceType)) {
     showToast(t("toast.connectType", { source: sourceType, target: input.value_type }));
+    return false;
+  }
+  if (createsCycle(snapshot.instances, targetId, sourceId)) {
+    showToast(t("toast.connectCycle"));
     return false;
   }
   target.inputs[inputName] = sourceId;
@@ -1259,6 +1286,56 @@ function connectInput(targetId: number, inputName: string, sourceId: number): bo
   renderAll();
   scheduleBuild();
   return true;
+}
+
+function disconnectInput(targetId: number, inputName: string): void {
+  const target = instanceById(targetId);
+  if (!target || target.inputs[inputName] === undefined) return;
+  delete target.inputs[inputName];
+  commitHistory();
+  renderAll();
+  scheduleBuild();
+}
+
+function linkCandidates(target: Instance, input: InputDef): Instance[] {
+  return snapshot.instances.filter((candidate) => {
+    if (candidate.id === target.id || createsCycle(snapshot.instances, target.id, candidate.id)) {
+      return false;
+    }
+    const candidateType = outputType(candidate);
+    return candidateType !== undefined && acceptsOutput(input.value_type, candidateType);
+  });
+}
+
+function renderPreviewTargets(): void {
+  const select = previewTargetSelect!;
+  const meshBlocks = snapshot.instances.filter((instance) => outputType(instance) === "mesh");
+  if (previewTargetId !== null && !meshBlocks.some((instance) => instance.id === previewTargetId)) {
+    previewTargetId = null;
+  }
+  select.replaceChildren();
+  const automatic = document.createElement("option");
+  automatic.value = "";
+  const autoTarget = autoMeshTarget();
+  automatic.textContent = `${t("viewport.outputAuto")} · ${autoTarget ? displayName(autoTarget) : t("viewport.outputNone")}`;
+  select.append(automatic);
+  for (const instance of meshBlocks) {
+    const option = document.createElement("option");
+    option.value = String(instance.id);
+    option.textContent = `${displayName(instance)}  #${instance.id}`;
+    select.append(option);
+  }
+  select.value = previewTargetId === null ? "" : String(previewTargetId);
+  select.disabled = meshBlocks.length === 0;
+  select.title = select.selectedOptions[0]?.textContent ?? "";
+}
+
+function updatePreviewAfterSelection(previousId: number | null): void {
+  if (previewTargetId !== null) return;
+  if ((meshTarget()?.id ?? null) !== previousId) {
+    framed = false;
+    build();
+  }
 }
 
 function displayName(instance: Instance): string {
@@ -1323,6 +1400,7 @@ function renderNotebookList(): void {
   const focused = document.activeElement as HTMLElement | null;
   const focusedId = focused?.closest<HTMLElement>(".notebook-item")?.dataset.id;
   const focusedParam = focused instanceof HTMLInputElement ? focused.dataset.notebookParam : undefined;
+  const focusedLink = focused instanceof HTMLSelectElement ? focused.dataset.notebookInput : undefined;
   const focusedHead = focused?.classList.contains("notebook-item-head") ?? false;
   list.replaceChildren();
   notebookCount!.textContent = String(snapshot.instances.length);
@@ -1366,34 +1444,75 @@ function renderNotebookList(): void {
     state.setAttribute("aria-label", instance.enabled ? "Enabled" : "Disabled");
     head.append(indexLabel, symbol, name, output, state);
     head.addEventListener("click", () => {
+      const previousId = meshTarget()?.id ?? null;
       selectedId = instance.id;
       selectedIds = new Set([instance.id]);
       renderInstances();
       renderProperties();
+      updatePreviewAfterSelection(previousId);
     });
     item.append(head);
 
     if (selectedId === instance.id) {
       const detail = document.createElement("div");
       detail.className = "notebook-detail";
-      const sourcesHeading = document.createElement("p");
-      sourcesHeading.className = "notebook-detail-heading";
-      sourcesHeading.textContent = t("notebook.sources");
-      detail.append(sourcesHeading);
-      const sources = Object.entries(instance.inputs)
-        .map(([key, id]) => ({ key, source: instanceById(id) }))
-        .filter((entry) => entry.source !== undefined);
-      if (sources.length === 0) {
-        const empty = document.createElement("div");
-        empty.className = "notebook-source";
-        empty.textContent = t("notebook.noSource");
-        detail.append(empty);
-      } else {
-        for (const { key, source } of sources) {
-          const sourceLabel = document.createElement("div");
-          sourceLabel.className = "notebook-source";
-          sourceLabel.textContent = `${fieldLabel(key)} ← ${displayName(source!)}`;
-          detail.append(sourceLabel);
+      const linkInputs = inputsFor(instance).filter(
+        (input) => ["field", "mesh", "list", "any"].includes(input.value_type),
+      );
+      if (linkInputs.length > 0 || isFreePortBlock(instance)) {
+        const sourcesHeading = document.createElement("p");
+        sourcesHeading.className = "notebook-detail-heading";
+        sourcesHeading.textContent = t("notebook.sources");
+        detail.append(sourcesHeading);
+        for (const input of linkInputs) {
+          const row = document.createElement("div");
+          row.className = "notebook-source-row";
+          const label = document.createElement("label");
+          label.textContent = fieldLabel(input.name);
+          const select = document.createElement("select");
+          select.id = `notebook-link-${instance.id}-${input.name}`;
+          select.dataset.notebookInput = input.name;
+          label.htmlFor = select.id;
+          const none = document.createElement("option");
+          none.value = "";
+          none.textContent = t("notebook.chooseSource");
+          select.append(none);
+          const candidates = linkCandidates(instance, input);
+          for (const candidate of candidates) {
+            const option = document.createElement("option");
+            option.value = String(candidate.id);
+            option.textContent = `${displayName(candidate)}  #${candidate.id}`;
+            select.append(option);
+          }
+          const linkedId = instance.inputs[input.name];
+          if (linkedId !== undefined && !candidates.some((candidate) => candidate.id === linkedId)) {
+            const invalid = document.createElement("option");
+            invalid.value = String(linkedId);
+            invalid.textContent = `#${linkedId} (${t("notebook.invalidSource")})`;
+            select.append(invalid);
+          }
+          select.value = linkedId === undefined ? "" : String(linkedId);
+          select.disabled = candidates.length === 0 && linkedId === undefined;
+          select.addEventListener("change", () => {
+            if (select.value === "") disconnectInput(instance.id, input.name);
+            else if (!connectInput(instance.id, input.name, Number(select.value))) {
+              select.value = linkedId === undefined ? "" : String(linkedId);
+            }
+          });
+          row.append(label, select);
+          detail.append(row);
+        }
+        if (isFreePortBlock(instance)) {
+          const addPort = document.createElement("button");
+          addPort.className = "notebook-detail-action";
+          addPort.type = "button";
+          addPort.textContent = t("notebook.addPort");
+          addPort.addEventListener("click", () => {
+            instance.ports = [...(instance.ports ?? []), nextFreePortName(instance)];
+            commitHistory();
+            renderAll();
+          });
+          detail.append(addPort);
         }
       }
 
@@ -1442,7 +1561,23 @@ function renderNotebookList(): void {
         setWorkspaceMode("graph");
         setGraphExpanded(true);
       });
-      detail.append(openGraph);
+      const actions = document.createElement("div");
+      actions.className = "notebook-detail-actions";
+      actions.append(openGraph);
+      if (outputType(instance) === "mesh") {
+        const preview = document.createElement("button");
+        preview.className = "notebook-detail-action";
+        preview.type = "button";
+        preview.textContent = t(previewTargetId === instance.id ? "viewport.previewPinned" : "viewport.previewThis");
+        preview.addEventListener("click", () => {
+          previewTargetId = previewTargetId === instance.id ? null : instance.id;
+          framed = false;
+          renderInstances();
+          build();
+        });
+        actions.append(preview);
+      }
+      detail.append(actions);
       item.append(detail);
     }
     list.append(item);
@@ -1455,6 +1590,10 @@ function renderNotebookList(): void {
       const input = [...(item?.querySelectorAll<HTMLInputElement>("input[data-notebook-param]") ?? [])]
         .find((candidate) => candidate.dataset.notebookParam === focusedParam);
       input?.focus({ preventScroll: true });
+    } else if (focusedLink !== undefined) {
+      const select = [...(item?.querySelectorAll<HTMLSelectElement>("select[data-notebook-input]") ?? [])]
+        .find((candidate) => candidate.dataset.notebookInput === focusedLink);
+      select?.focus({ preventScroll: true });
     } else if (focusedHead) {
       item?.querySelector<HTMLButtonElement>(".notebook-item-head")?.focus({ preventScroll: true });
     }
@@ -1494,6 +1633,8 @@ function renderPalette(): void {
     heading.textContent = categoryLabel(category);
     paletteList!.append(heading);
     for (const def of defs) {
+      const entry = document.createElement("div");
+      entry.className = "block-entry";
       const button = document.createElement("button");
       button.className = "block-button";
       button.type = "button";
@@ -1505,13 +1646,31 @@ function renderPalette(): void {
       type.textContent = def.overloads[0]?.output ?? "";
       button.append(name, type);
       button.addEventListener("click", () => addBlock(def));
-      paletteList!.append(button);
+      entry.append(button);
+      const connections = autoConnectionsFor(def);
+      const count = Object.keys(connections).length;
+      if (count > 0) {
+        const connect = document.createElement("button");
+        connect.className = "block-connect-button";
+        connect.type = "button";
+        connect.textContent = "↳";
+        connect.title = t("palette.addConnect", { count });
+        connect.setAttribute("aria-label", connect.title);
+        connect.addEventListener("click", () => {
+          addBlock(def, true);
+          if (document.body.classList.contains("show-palette")) togglePaletteButton?.click();
+        });
+        entry.append(connect);
+      }
+      paletteList!.append(entry);
     }
   }
 }
 
 function renderInstances(): void {
+  renderPalette();
   renderNotebookList();
+  renderPreviewTargets();
   layoutNodes();
   updateCanvasSize();
   instanceList!.replaceChildren();
@@ -1622,6 +1781,7 @@ function renderInstances(): void {
 
     card.addEventListener("click", (event) => {
       if (performance.now() < suppressClickUntil) return;
+      const previousTargetId = meshTarget()?.id ?? null;
       if (event.shiftKey) {
         if (selectedIds.has(instance.id)) {
           selectedIds.delete(instance.id);
@@ -1641,6 +1801,7 @@ function renderInstances(): void {
       }
       renderInstances();
       renderProperties();
+      updatePreviewAfterSelection(previousTargetId);
     });
     instanceList!.append(card);
   }
@@ -1832,27 +1993,28 @@ function renderLink(parent: HTMLElement, instance: Instance, input: InputDef): v
   none.textContent = t("properties.none");
   select.append(none);
 
-  for (const candidate of snapshot.instances) {
-    if (candidate.id === instance.id) continue;
-    const candidateType = outputType(candidate);
-    if (!candidateType) continue;
-    if (input.value_type !== "any" && candidateType !== input.value_type) continue;
+  for (const candidate of linkCandidates(instance, input)) {
     const option = document.createElement("option");
     option.value = String(candidate.id);
     option.textContent = `${displayName(candidate)}  (#${candidate.id})`;
     select.append(option);
   }
 
+  const linkedId = instance.inputs[input.name];
+  if (linkedId !== undefined && ![...select.options].some((option) => option.value === String(linkedId))) {
+    const invalid = document.createElement("option");
+    invalid.value = String(linkedId);
+    invalid.textContent = `#${linkedId} (${t("notebook.invalidSource")})`;
+    select.append(invalid);
+  }
+
   select.value = instance.inputs[input.name]?.toString() ?? "";
   select.addEventListener("change", () => {
     if (select.value === "") {
-      delete instance.inputs[input.name];
+      disconnectInput(instance.id, input.name);
     } else {
-      instance.inputs[input.name] = Number(select.value);
+      connectInput(instance.id, input.name, Number(select.value));
     }
-    commitHistory();
-    renderInstances();
-    scheduleBuild();
   });
 
   const drop = document.createElement("div");
@@ -2091,11 +2253,7 @@ function renderWires(): void {
       path.setAttribute("class", input.value_type === "mesh" ? "wire mesh" : "wire");
       path.addEventListener("click", (event) => {
         event.stopPropagation();
-        delete instance.inputs[input.name];
-        commitHistory();
-        renderAll();
-        scheduleWires();
-        scheduleBuild();
+        disconnectInput(instance.id, input.name);
       });
       svg.append(path);
     }
@@ -2113,7 +2271,6 @@ function scheduleWires(): void {
 }
 
 function renderAll(): void {
-  renderPalette();
   renderInstances();
   renderProperties();
 }
@@ -2169,15 +2326,41 @@ function buildFeatureGeometry(
   return result;
 }
 
-function meshTarget(): Instance | undefined {
+function autoMeshTarget(): Instance | undefined {
   const selected = selectedInstance();
   if (selected && outputType(selected) === "mesh") return selected;
   return [...snapshot.instances].reverse().find((instance) => outputType(instance) === "mesh");
 }
 
+function meshTarget(): Instance | undefined {
+  if (previewTargetId !== null) {
+    const pinned = instanceById(previewTargetId);
+    if (pinned && outputType(pinned) === "mesh") return pinned;
+  }
+  return autoMeshTarget();
+}
+
+function clearMeshPreview(): void {
+  ++buildToken;
+  window.clearTimeout(buildTimer);
+  if (currentMesh) scene.remove(currentMesh);
+  if (currentFeatures) {
+    scene.remove(currentFeatures);
+    currentFeatures.geometry.dispose();
+  }
+  currentGeometry?.dispose();
+  currentMesh = null;
+  currentFeatures = null;
+  currentGeometry = null;
+  framed = false;
+  errorId = null;
+  setDiagnostics(null);
+}
+
 function build(): void {
   const target = meshTarget();
   if (!target) {
+    clearMeshPreview();
     setLocalizedStatus("status.noMesh");
     return;
   }
@@ -2285,6 +2468,7 @@ async function loadJson(file: File): Promise<void> {
       throw new Error("expected a version 1 Notebook snapshot");
     }
     snapshot = parsed;
+    previewTargetId = null;
     selectedId = snapshot.instances[0]?.id ?? null;
     selectedIds = new Set(selectedId === null ? [] : [selectedId]);
     framed = false;
@@ -2339,6 +2523,12 @@ async function main(): Promise<void> {
     if (!document.body.classList.contains("show-palette")) togglePaletteButton?.click();
     blockSearch?.focus();
   });
+  previewTargetSelect!.addEventListener("change", () => {
+    previewTargetId = previewTargetSelect!.value === "" ? null : Number(previewTargetSelect!.value);
+    framed = false;
+    renderPreviewTargets();
+    build();
+  });
 
   buildButton!.addEventListener("click", build);
   undoButton!.addEventListener("click", undo);
@@ -2359,6 +2549,7 @@ async function main(): Promise<void> {
   });
   templateButton!.addEventListener("click", () => {
     snapshot = JSON.parse(notebook_template()) as Snapshot;
+    previewTargetId = null;
     selectedId = snapshot.instances[snapshot.instances.length - 1]?.id ?? null;
     selectedIds = new Set(selectedId === null ? [] : [selectedId]);
     framed = false;
@@ -2372,6 +2563,8 @@ async function main(): Promise<void> {
   });
   newButton!.addEventListener("click", () => {
     snapshot = { version: 1, next_id: 1, instances: [], update_policy: "auto" };
+    previewTargetId = null;
+    clearMeshPreview();
     selectedId = null;
     selectedIds.clear();
     errorId = null;
