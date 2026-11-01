@@ -52,6 +52,16 @@ The dev server serves the Notebook prototype at `http://127.0.0.1:5173/`.
 
 本地变量/Graph 测试：在 `bindings/web` 下运行 `pnpm test:unit`（不使用 GitHub CI）。
 
+### V0.6 变量公式与依赖
+
+1. 在「变量」面板中先创建 `baseRadius = 12 mm`、`wallThickness = 2 mm` 两个普通变量，再创建 `outerRadius`（单位选毫米）。
+2. 在 `outerRadius` 卡片的 `ƒx` 输入框中填写 `baseRadius + wallThickness`，按回车或离开输入框应用，结果为 `14 mm`；也可写 `baseRadius + 2 mm` 或 `baseRadius * 1.5`。
+3. 将 Block 的数值参数绑定到 `outerRadius`。修改 `baseRadius` 后，公式与已绑定 Block 同步更新，并高亮受影响的下游依赖。
+4. 支持 `+ - * /`、括号、负号、科学计数法、中文变量名，以及 `mm`、`cm`、`m`、`in`、`inch`、`rad`、`deg` 单位后缀；加减要求同量纲，乘除只允许无量纲缩放或同量纲相除。
+5. 系统会拒绝循环引用、未定义变量、除零和不兼容单位。重命名变量会同步修改公式引用；有其他公式依赖的变量必须先解除依赖才能删除。清空公式可恢复手动数值。
+
+公式以可选的 `expression` 字段保存在 v1 JSON 中，计算值仍按旧版 Number 参数传给 WASM；变量脚本**不执行任意 JavaScript**。
+
 The UI uses localStorage keys `zeroset.theme`, `zeroset.language`, and
 `zeroset.panel-layout` for persisted preferences and panel widths.
 
