@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>ZeroSet · Notebook</title>
+    <title>ZeroSets · 隐式建模工作台</title>
     <link rel="stylesheet" href="/src/style.css" />
   </head>
   <body>
@@ -168,11 +168,24 @@
       <div class="panel-head">
         <div class="panel-heading">
           <span class="panel-eyebrow" data-i18n="panel.workspace">Workspace</span>
-          <h2 data-i18n="panel.notebook">Notebook</h2>
+          <h2 id="workspace-title" data-i18n="panel.notebook">Notebook</h2>
         </div>
-        <span class="panel-chip" data-i18n="panel.graph">Graph</span>
+        <span id="notebook-count" class="panel-count">0</span>
+      </div>
+      <div class="workspace-modes" role="group" aria-label="Notebook 与 Graph 工作模式">
+        <div class="workspace-segments">
+          <button id="show-notebook" type="button" class="active" aria-pressed="true">Notebook</button>
+          <button id="show-graph" type="button" aria-pressed="false">Graph</button>
+        </div>
+        <span class="workspace-mode-spacer"></span>
+        <button id="notebook-add" type="button" class="workspace-action" data-i18n-title="action.addBlock" title="添加 Block">＋</button>
+        <button id="graph-expand" type="button" class="workspace-action hidden" aria-pressed="false" data-i18n-title="action.expandGraph" title="展开关系图至整个工作区">
+          <svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M6 2.5H2.5V6M10 2.5h3.5V6M2.5 10v3.5H6M13.5 10v3.5H10"/></svg>
+          <span id="graph-expand-label" data-i18n="action.expandGraph">展开</span>
+        </button>
       </div>
       <div id="notebook-body">
+        <div id="notebook-list" role="list" aria-label="Notebook Block 工作流"></div>
         <div id="graph-world">
           <svg id="wires" aria-hidden="true"></svg>
           <div id="instance-list"></div>

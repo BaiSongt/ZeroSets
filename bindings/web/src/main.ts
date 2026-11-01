@@ -114,6 +114,14 @@ const properties = document.querySelector<HTMLElement>("#properties");
 const propertiesBadge = document.querySelector<HTMLElement>("#properties-badge");
 const notebook = document.querySelector<HTMLElement>("#notebook");
 const notebookBody = document.querySelector<HTMLElement>("#notebook-body");
+const notebookList = document.querySelector<HTMLElement>("#notebook-list");
+const notebookCount = document.querySelector<HTMLElement>("#notebook-count");
+const workspaceTitle = document.querySelector<HTMLElement>("#workspace-title");
+const showNotebookButton = document.querySelector<HTMLButtonElement>("#show-notebook");
+const showGraphButton = document.querySelector<HTMLButtonElement>("#show-graph");
+const graphExpandButton = document.querySelector<HTMLButtonElement>("#graph-expand");
+const graphExpandLabel = document.querySelector<HTMLElement>("#graph-expand-label");
+const notebookAddButton = document.querySelector<HTMLButtonElement>("#notebook-add");
 const graphWorld = document.querySelector<HTMLElement>("#graph-world");
 const wires = document.querySelector<SVGSVGElement>("#wires");
 const marquee = document.querySelector<HTMLElement>("#marquee");
@@ -147,6 +155,14 @@ if (
   !paletteList ||
   !notebook ||
   !notebookBody ||
+  !notebookList ||
+  !notebookCount ||
+  !workspaceTitle ||
+  !showNotebookButton ||
+  !showGraphButton ||
+  !graphExpandButton ||
+  !graphExpandLabel ||
+  !notebookAddButton ||
   !graphWorld ||
   !wires ||
   !marquee ||
@@ -186,6 +202,10 @@ let selectedIds = new Set<number>();
 let errorId: number | null = null;
 let autoUpdate = true;
 let suppressClickUntil = 0;
+type WorkspaceMode = "notebook" | "graph";
+const WORKSPACE_MODE_KEY = "zeroset.workspace-mode";
+let workspaceMode: WorkspaceMode = "notebook";
+let graphExpanded = false;
 let zoom = 1;
 let panX = 0;
 let panY = 0;
@@ -203,6 +223,7 @@ const history: HistoryEntry[] = [];
 let historyIndex = -1;
 const HISTORY_LIMIT = 80;
 let buildTimer: number | undefined;
+let notebookHistoryTimer: number | undefined;
 let buildToken = 0;
 let framed = false;
 
@@ -332,12 +353,13 @@ function refreshLayout(): void {
 }
 
 function clampPanelLayout(): void {
+  if (graphExpanded) return;
   const width = document.documentElement.clientWidth;
-  const paletteWidth = palette?.getBoundingClientRect().width ?? 0;
   const propertiesWidth = properties?.getBoundingClientRect().width ?? 0;
   const graphWidth = notebook?.getBoundingClientRect().width ?? 0;
-  if (paletteWidth <= 0 || propertiesWidth <= 0 || graphWidth <= 0) return;
-  const maxGraph = Math.max(300, width - paletteWidth - propertiesWidth - 12 - 280);
+  if (graphWidth <= 0) return;
+  // Block 库是浮层，不应占用分栏可用宽度。
+  const maxGraph = Math.max(260, width - propertiesWidth - 8 - 280);
   if (graphWidth > maxGraph) {
     setPanelWidth("graph", maxGraph);
   }
@@ -840,6 +862,18 @@ function commitHistory(): void {
   updateHistoryButtons();
 }
 
+function flushNotebookHistory(): void {
+  if (notebookHistoryTimer === undefined) return;
+  window.clearTimeout(notebookHistoryTimer);
+  notebookHistoryTimer = undefined;
+  commitHistory();
+}
+
+function scheduleNotebookHistory(): void {
+  window.clearTimeout(notebookHistoryTimer);
+  notebookHistoryTimer = window.setTimeout(flushNotebookHistory, 500);
+}
+
 function restoreHistory(entry: HistoryEntry): void {
   snapshot = structuredClone(entry.snapshot);
   nodePositions.clear();
@@ -856,12 +890,14 @@ function restoreHistory(entry: HistoryEntry): void {
 }
 
 function undo(): void {
+  flushNotebookHistory();
   if (historyIndex <= 0) return;
   historyIndex -= 1;
   restoreHistory(history[historyIndex]);
 }
 
 function redo(): void {
+  flushNotebookHistory();
   if (historyIndex < 0 || historyIndex >= history.length - 1) return;
   historyIndex += 1;
   restoreHistory(history[historyIndex]);
@@ -938,6 +974,7 @@ function startNodeDrag(event: PointerEvent, instance: Instance): void {
   for (const node of instanceList!.querySelectorAll<HTMLElement>(".instance")) {
     node.classList.toggle("selected", selectedIds.has(Number(node.dataset.id)));
   }
+  renderNotebookList();
   renderProperties();
 
   const entries = [...selectedIds]
@@ -1236,6 +1273,194 @@ function displayName(instance: Instance): string {
   return instance.name;
 }
 
+// Notebook 与 Graph 只改变展示方式，始终读写同一份内核快照。
+function syncWorkspaceModeControls(): void {
+  const graphMode = workspaceMode === "graph";
+  document.body.classList.toggle("workspace-graph", graphMode);
+  document.body.classList.toggle("graph-expanded", graphMode && graphExpanded);
+  showNotebookButton!.classList.toggle("active", !graphMode);
+  showNotebookButton!.setAttribute("aria-pressed", String(!graphMode));
+  showGraphButton!.classList.toggle("active", graphMode);
+  showGraphButton!.setAttribute("aria-pressed", String(graphMode));
+  graphExpandButton!.classList.toggle("hidden", !graphMode);
+  graphExpandButton!.setAttribute("aria-pressed", String(graphMode && graphExpanded));
+  const expandKey = graphExpanded ? "action.restoreGraph" : "action.expandGraph";
+  graphExpandButton!.title = t(expandKey);
+  graphExpandLabel!.textContent = t(expandKey);
+  workspaceTitle!.textContent = t(graphMode ? "panel.graph" : "panel.notebook");
+}
+
+function setWorkspaceMode(nextMode: WorkspaceMode): void {
+  workspaceMode = nextMode;
+  if (nextMode === "notebook") graphExpanded = false;
+  syncWorkspaceModeControls();
+  try {
+    localStorage.setItem(WORKSPACE_MODE_KEY, nextMode);
+  } catch (error) {
+    console.warn("无法保存工作区模式", error);
+  }
+  requestAnimationFrame(() => {
+    refreshLayout();
+    if (nextMode === "graph") fitCanvas();
+    scheduleWires();
+  });
+}
+
+function setGraphExpanded(expanded: boolean): void {
+  if (workspaceMode !== "graph") return;
+  graphExpanded = expanded;
+  syncWorkspaceModeControls();
+  requestAnimationFrame(() => {
+    refreshLayout();
+    fitCanvas();
+    scheduleWires();
+  });
+}
+
+function renderNotebookList(): void {
+  const list = notebookList!;
+  const scrollTop = list.scrollTop;
+  const focused = document.activeElement as HTMLElement | null;
+  const focusedId = focused?.closest<HTMLElement>(".notebook-item")?.dataset.id;
+  const focusedParam = focused instanceof HTMLInputElement ? focused.dataset.notebookParam : undefined;
+  const focusedHead = focused?.classList.contains("notebook-item-head") ?? false;
+  list.replaceChildren();
+  notebookCount!.textContent = String(snapshot.instances.length);
+  if (snapshot.instances.length === 0) {
+    const empty = document.createElement("p");
+    empty.className = "notebook-empty";
+    empty.textContent = t("notebook.empty");
+    list.append(empty);
+    return;
+  }
+
+  for (const [index, instance] of snapshot.instances.entries()) {
+    const item = document.createElement("section");
+    item.className = "notebook-item";
+    item.setAttribute("role", "listitem");
+    item.dataset.id = String(instance.id);
+    item.classList.toggle("selected", selectedId === instance.id);
+    item.classList.toggle("error", errorId === instance.id);
+    item.classList.toggle("disabled", !instance.enabled);
+
+    const head = document.createElement("button");
+    head.type = "button";
+    head.className = "notebook-item-head";
+    head.setAttribute("aria-expanded", String(selectedId === instance.id));
+    const indexLabel = document.createElement("span");
+    indexLabel.className = "notebook-index";
+    indexLabel.textContent = String(index + 1).padStart(2, "0");
+    const symbol = document.createElement("span");
+    symbol.className = "notebook-symbol";
+    const kind = outputType(instance);
+    symbol.textContent = kind === "mesh" ? "M" : kind === "field" ? "F" : "#";
+    const name = document.createElement("span");
+    name.className = "notebook-block-name";
+    name.textContent = displayName(instance);
+    name.title = displayName(instance);
+    const output = document.createElement("span");
+    output.className = "notebook-output";
+    output.textContent = outputType(instance) ?? "?";
+    const state = document.createElement("span");
+    state.className = "notebook-state";
+    state.setAttribute("aria-label", instance.enabled ? "Enabled" : "Disabled");
+    head.append(indexLabel, symbol, name, output, state);
+    head.addEventListener("click", () => {
+      selectedId = instance.id;
+      selectedIds = new Set([instance.id]);
+      renderInstances();
+      renderProperties();
+    });
+    item.append(head);
+
+    if (selectedId === instance.id) {
+      const detail = document.createElement("div");
+      detail.className = "notebook-detail";
+      const sourcesHeading = document.createElement("p");
+      sourcesHeading.className = "notebook-detail-heading";
+      sourcesHeading.textContent = t("notebook.sources");
+      detail.append(sourcesHeading);
+      const sources = Object.entries(instance.inputs)
+        .map(([key, id]) => ({ key, source: instanceById(id) }))
+        .filter((entry) => entry.source !== undefined);
+      if (sources.length === 0) {
+        const empty = document.createElement("div");
+        empty.className = "notebook-source";
+        empty.textContent = t("notebook.noSource");
+        detail.append(empty);
+      } else {
+        for (const { key, source } of sources) {
+          const sourceLabel = document.createElement("div");
+          sourceLabel.className = "notebook-source";
+          sourceLabel.textContent = `${fieldLabel(key)} ← ${displayName(source!)}`;
+          detail.append(sourceLabel);
+        }
+      }
+
+      const numbers = inputsFor(instance)
+        .filter((input) => input.value_type === "number" && instance.inputs[input.name] === undefined)
+        .slice(0, 2);
+      if (numbers.length > 0) {
+        const paramsHeading = document.createElement("p");
+        paramsHeading.className = "notebook-detail-heading";
+        paramsHeading.textContent = t("notebook.params");
+        detail.append(paramsHeading);
+        for (const input of numbers) {
+          const current = instance.params[input.name] ?? defaultParam(input);
+          const param = current && "Number" in current
+            ? current.Number
+            : { value: 0, unit: "unitless" as Unit };
+          const row = document.createElement("div");
+          row.className = "notebook-quick-row";
+          const label = document.createElement("label");
+          label.textContent = `${fieldLabel(input.name)} (${unitLabel(param.unit)})`;
+          const value = document.createElement("input");
+          value.type = "number";
+          value.step = "any";
+          value.value = String(param.value);
+          value.dataset.notebookParam = input.name;
+          value.dataset.instanceId = String(instance.id);
+          value.addEventListener("input", () => {
+            const nextValue = Number(value.value);
+            if (!Number.isFinite(nextValue) || value.value === "") return;
+            instance.params[input.name] = { Number: { value: nextValue, unit: param.unit } };
+            renderProperties();
+            scheduleBuild();
+            scheduleNotebookHistory();
+          });
+          value.addEventListener("change", flushNotebookHistory);
+          row.append(label, value);
+          detail.append(row);
+        }
+      }
+
+      const openGraph = document.createElement("button");
+      openGraph.type = "button";
+      openGraph.className = "notebook-detail-action";
+      openGraph.textContent = t("notebook.openGraph");
+      openGraph.addEventListener("click", () => {
+        setWorkspaceMode("graph");
+        setGraphExpanded(true);
+      });
+      detail.append(openGraph);
+      item.append(detail);
+    }
+    list.append(item);
+  }
+  list.scrollTop = scrollTop;
+  // WASM 自动构建会刷新状态；保留正在编辑的快捷参数焦点。
+  if (focusedId !== undefined) {
+    const item = list.querySelector<HTMLElement>(`.notebook-item[data-id="${focusedId}"]`);
+    if (focusedParam !== undefined) {
+      const input = [...(item?.querySelectorAll<HTMLInputElement>("input[data-notebook-param]") ?? [])]
+        .find((candidate) => candidate.dataset.notebookParam === focusedParam);
+      input?.focus({ preventScroll: true });
+    } else if (focusedHead) {
+      item?.querySelector<HTMLButtonElement>(".notebook-item-head")?.focus({ preventScroll: true });
+    }
+  }
+}
+
 function renderPalette(): void {
   paletteList!.replaceChildren();
   const query = blockSearch?.value.trim().toLowerCase() ?? "";
@@ -1286,6 +1511,7 @@ function renderPalette(): void {
 }
 
 function renderInstances(): void {
+  renderNotebookList();
   layoutNodes();
   updateCanvasSize();
   instanceList!.replaceChildren();
@@ -1478,6 +1704,7 @@ function renderParam(
       instance.params[input.name] = {
         Number: { value: Number(value.value) || 0, unit: unit.value as Unit },
       };
+      renderNotebookList();
       scheduleBuild();
     });
     value.addEventListener("change", commitHistory);
@@ -1624,6 +1851,7 @@ function renderLink(parent: HTMLElement, instance: Instance, input: InputDef): v
       instance.inputs[input.name] = Number(select.value);
     }
     commitHistory();
+    renderInstances();
     scheduleBuild();
   });
 
@@ -2085,6 +2313,7 @@ async function main(): Promise<void> {
     syncLanguageThemeControls();
     if (statusState) statusLabel!.textContent = t(statusState.key, statusState.vars);
     renderAll();
+    syncWorkspaceModeControls();
   });
   languageButton!.addEventListener("click", () => toggleLanguage());
   themeButton!.addEventListener("click", () => toggleTheme());
@@ -2096,6 +2325,20 @@ async function main(): Promise<void> {
   selectedId = snapshot.instances[snapshot.instances.length - 1]?.id ?? null;
   selectedIds = new Set(selectedId === null ? [] : [selectedId]);
   syncPolicy();
+
+  try {
+    workspaceMode = localStorage.getItem(WORKSPACE_MODE_KEY) === "graph" ? "graph" : "notebook";
+  } catch (error) {
+    console.warn("无法恢复工作区模式", error);
+  }
+  syncWorkspaceModeControls();
+  showNotebookButton!.addEventListener("click", () => setWorkspaceMode("notebook"));
+  showGraphButton!.addEventListener("click", () => setWorkspaceMode("graph"));
+  graphExpandButton!.addEventListener("click", () => setGraphExpanded(!graphExpanded));
+  notebookAddButton!.addEventListener("click", () => {
+    if (!document.body.classList.contains("show-palette")) togglePaletteButton?.click();
+    blockSearch?.focus();
+  });
 
   buildButton!.addEventListener("click", build);
   undoButton!.addEventListener("click", undo);
@@ -2189,6 +2432,7 @@ async function main(): Promise<void> {
   notebook!.addEventListener(
     "wheel",
     (event) => {
+      if (workspaceMode !== "graph") return;
       event.preventDefault();
       const rect = notebookBody!.getBoundingClientRect();
       setZoomAt(
@@ -2200,6 +2444,7 @@ async function main(): Promise<void> {
     { passive: false },
   );
   notebook!.addEventListener("pointerdown", (event) => {
+    if (workspaceMode !== "graph") return;
     if (event.button === 0) {
       const target = event.target as HTMLElement;
       if (notebookBody!.contains(target) && !target.closest(".instance")) {
@@ -2218,6 +2463,7 @@ async function main(): Promise<void> {
     notebook!.classList.add("panning");
   });
   notebook!.addEventListener("pointermove", (event) => {
+    if (workspaceMode !== "graph") return;
     if (!panStart) return;
     panX = panStart.panX + event.clientX - panStart.x;
     panY = panStart.panY + event.clientY - panStart.y;
@@ -2229,7 +2475,9 @@ async function main(): Promise<void> {
   };
   notebook!.addEventListener("pointerup", endPan);
   notebook!.addEventListener("pointercancel", endPan);
-  notebook!.addEventListener("contextmenu", (event) => event.preventDefault());
+  notebook!.addEventListener("contextmenu", (event) => {
+    if (workspaceMode === "graph") event.preventDefault();
+  });
   zoomIn!.addEventListener("click", () => zoomAtCenter(1.15));
   zoomOut!.addEventListener("click", () => zoomAtCenter(1 / 1.15));
   fitButton!.addEventListener("click", fitCanvas);
@@ -2246,8 +2494,14 @@ async function main(): Promise<void> {
   window.addEventListener("keydown", (event) => {
     const target = event.target as HTMLElement | null;
     const editing = Boolean(target?.closest("input, textarea, select"));
+    if (event.key === "Escape" && graphExpanded) {
+      event.preventDefault();
+      setGraphExpanded(false);
+      return;
+    }
     if (!editing && event.key === "/") {
       event.preventDefault();
+      if (!document.body.classList.contains("show-palette")) togglePaletteButton?.click();
       blockSearch?.focus();
       blockSearch?.select();
       return;
